@@ -158,5 +158,10 @@ quick: gen_payload sim_write
 
 # Visualization (uses latest simulation results)
 viz:
-	$(PYTHON) examples/visualization/demo.py all --from-metrics output/metrics/latest.json
+	$(PYTHON) -m src.visualization.report_generator all --from-metrics output/metrics/latest.json
+
+# Web Visualization
+
+
+
 

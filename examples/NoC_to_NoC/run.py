@@ -33,6 +33,7 @@ sys.path.insert(0, str(project_root))
 from src.core import NoCSystem
 from src.config import load_noc_traffic_config, NoCTrafficConfig, TrafficPattern
 from src.traffic import TrafficPatternGenerator
+from src.visualization import MetricsCollector
 
 
 def print_header(title: str) -> None:
@@ -158,32 +159,87 @@ def run_traffic_pattern(
         print_section("Simulation")
         print("  Starting all node transfers...")
 
+    # Create metrics collector for detailed performance data
+    collector = MetricsCollector(system, capture_interval=1)
+
     sim_start = time.perf_counter()
     system.start_all_transfers()
 
-    # Run simulation
+    # Run simulation with metrics collection
     max_cycles = 10000
-    cycles = system.run_until_complete(max_cycles)
-    sim_end = time.perf_counter()
+    cycles = 0
+    while not system.all_transfers_complete and cycles < max_cycles:
+        system.process_cycle()
+        collector.capture()
+        cycles += 1
 
+    sim_end = time.perf_counter()
     sim_time_ms = (sim_end - sim_start) * 1000
 
     if verbose:
         print(f"  Simulation completed in {cycles} cycles")
         print(f"  Wall-clock time: {sim_time_ms:.2f} ms")
 
-    # Performance metrics
+    # === Collect Performance Metrics ===
     total_bytes = config.transfer_size * system.num_nodes
     throughput_bytes_per_cycle = total_bytes / cycles if cycles > 0 else 0
-    avg_latency = cycles / system.num_nodes if system.num_nodes > 0 else 0
+
+    # Router flit statistics
+    flit_stats = system.get_flit_stats()
+    total_flits = sum(flit_stats.values())
+    active_routers = sum(1 for v in flit_stats.values() if v > 0)
+    avg_flits_per_router = total_flits / len(flit_stats) if flit_stats else 0
+    max_flits_router = max(flit_stats.values()) if flit_stats else 0
+
+    # Buffer utilization from collector
+    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
+    peak_buffer_util = max(buffer_occupancies) if buffer_occupancies else 0
+    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
+    # Average during active periods (when flits are in flight)
+    active_occupancies = [x for x in buffer_occupancies if x > 0]
+    active_avg_buffer = sum(active_occupancies) / len(active_occupancies) if active_occupancies else 0
+    active_pct = len(active_occupancies) / len(buffer_occupancies) * 100 if buffer_occupancies else 0
+
+    # Latency statistics from collector
+    latencies = collector.get_all_latencies()
+    if latencies:
+        import statistics
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        avg_latency = statistics.mean(latencies)
+        std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+    else:
+        min_latency = max_latency = avg_latency = std_latency = 0
+        # Fallback: estimate from cycles
+        avg_latency = cycles / system.num_nodes if system.num_nodes > 0 else 0
 
     if verbose:
         print_section("Performance Metrics")
         print(f"  Total Cycles:      {cycles}")
         print(f"  Total Data:        {total_bytes} bytes")
         print(f"  Throughput:        {throughput_bytes_per_cycle:.2f} bytes/cycle")
-        print(f"  Avg Latency:       {avg_latency:.2f} cycles/transfer")
         print(f"  Simulation Speed:  {cycles / sim_time_ms * 1000:.0f} cycles/sec")
+
+        print_section("Router Statistics")
+        print(f"  Total Flits:       {total_flits}")
+        print(f"  Active Routers:    {active_routers}/{len(flit_stats)}")
+        print(f"  Avg Flits/Router:  {avg_flits_per_router:.1f}")
+        print(f"  Max Flits (router):{max_flits_router}")
+
+        print_section("Latency Distribution")
+        if latencies:
+            print(f"  Samples:           {len(latencies)}")
+            print(f"  Min Latency:       {min_latency} cycles")
+            print(f"  Max Latency:       {max_latency} cycles")
+            print(f"  Avg Latency:       {avg_latency:.2f} cycles")
+            print(f"  Std Dev:           {std_latency:.2f} cycles")
+        else:
+            print(f"  Avg Latency:       {avg_latency:.2f} cycles (estimated)")
+
+        print_section("Buffer Utilization")
+        print(f"  Peak Occupancy:    {peak_buffer_util} flits")
+        print(f"  Avg Occupancy:     {avg_buffer_util:.3f} flits")
+        print(f"  Active Avg:        {active_avg_buffer:.2f} flits ({active_pct:.1f}% of cycles active)")
 
     # Golden Comparison / Verification
     if verbose:
@@ -246,7 +302,6 @@ def run_traffic_pattern(
         'cycles': cycles,
         'total_bytes': total_bytes,
         'throughput': throughput_bytes_per_cycle,
-        'avg_latency': avg_latency,
         'pass_count': pass_count,
         'fail_count': fail_count,
         'sim_time_ms': sim_time_ms,
@@ -257,6 +312,20 @@ def run_traffic_pattern(
         'mesh_rows': config.mesh_rows,
         'num_nodes': system.num_nodes,
         'transfer_size': config.transfer_size,
+        # Router statistics
+        'total_flits': total_flits,
+        'active_routers': active_routers,
+        'avg_flits_per_router': avg_flits_per_router,
+        'max_flits_router': max_flits_router,
+        # Latency statistics
+        'latency_samples': len(latencies),
+        'min_latency': min_latency,
+        'max_latency': max_latency,
+        'avg_latency': avg_latency,
+        'std_latency': std_latency,
+        # Buffer utilization
+        'peak_buffer_util': peak_buffer_util,
+        'avg_buffer_util': avg_buffer_util,
     }
     
     # Save as latest.json

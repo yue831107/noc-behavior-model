@@ -49,7 +49,7 @@ class MetricsCollector:
                 collector.capture()
         
         # Get data for visualization
-        matrix = collector.get_buffer_occupancy_matrix()
+        cycles, counts = collector.get_flit_count_over_time()
         latencies = collector.get_all_latencies()
     """
     
@@ -71,7 +71,26 @@ class MetricsCollector:
         self._last_capture_cycle = -1
         self._last_completed = 0
         self._last_bytes = 0
-    
+
+        # Register packet arrival callback for latency tracking
+        if hasattr(system, 'set_packet_arrival_callback'):
+            system.set_packet_arrival_callback(self._on_packet_arrived)
+
+    def _on_packet_arrived(self, packet_id: int, creation_time: int, arrival_time: int) -> None:
+        """
+        Callback when a packet arrives at destination.
+
+        Calculates latency from packet creation to arrival.
+
+        Args:
+            packet_id: Unique packet identifier.
+            creation_time: Cycle when packet was created at SlaveNI.
+            arrival_time: Cycle when packet arrived at MasterNI.
+        """
+        latency = arrival_time - creation_time
+        if latency >= 0:
+            self.add_latency_sample(latency)
+
     @property
     def mesh(self) -> "Mesh":
         """Get mesh from system."""
@@ -132,31 +151,6 @@ class MetricsCollector:
         
         return snapshot
     
-    def get_buffer_occupancy_matrix(
-        self,
-        snapshot_index: int = -1,
-    ) -> np.ndarray:
-        """
-        Get buffer occupancy as a 2D matrix for heatmap visualization.
-        
-        Args:
-            snapshot_index: Which snapshot to use (-1 = latest).
-        
-        Returns:
-            2D numpy array of shape (rows, cols) with occupancy values.
-        """
-        if not self.snapshots:
-            return np.zeros((self.mesh_rows, self.mesh_cols))
-        
-        snapshot = self.snapshots[snapshot_index]
-        matrix = np.zeros((self.mesh_rows, self.mesh_cols))
-        
-        for (x, y), occupancy in snapshot.buffer_occupancy.items():
-            if 0 <= y < self.mesh_rows and 0 <= x < self.mesh_cols:
-                matrix[y, x] = occupancy
-        
-        return matrix
-    
     def get_buffer_occupancy_over_time(self) -> Tuple[List[int], np.ndarray]:
         """
         Get buffer occupancy time series for all routers.
@@ -169,11 +163,42 @@ class MetricsCollector:
         
         cycles = [s.cycle for s in self.snapshots]
         data = np.array([
-            self.get_buffer_occupancy_matrix(i)
+            self._get_raw_occupancy_matrix(i)
             for i in range(len(self.snapshots))
         ])
         
         return cycles, data
+
+    def _get_raw_occupancy_matrix(self, snapshot_index: int) -> np.ndarray:
+        """Internal helper for occupancy data."""
+        snapshot = self.snapshots[snapshot_index]
+        matrix = np.zeros((self.mesh_rows, self.mesh_cols))
+        for (x, y), occupancy in snapshot.buffer_occupancy.items():
+            if 0 <= y < self.mesh_rows and 0 <= x < self.mesh_cols:
+                matrix[y, x] = occupancy
+        return matrix
+
+    def get_utilization_matrix(self, snapshot_index: int = -1) -> np.ndarray:
+        """
+        Get flit forwarded counts (utilization) as a 2D matrix.
+        
+        Args:
+            snapshot_index: Which snapshot to use (-1 = latest/cumulative).
+        
+        Returns:
+            2D numpy array with flit counts.
+        """
+        if not self.snapshots:
+            return np.zeros((self.mesh_rows, self.mesh_cols))
+        
+        snapshot = self.snapshots[snapshot_index]
+        matrix = np.zeros((self.mesh_rows, self.mesh_cols))
+        
+        for (x, y), count in snapshot.router_flit_counts.items():
+            if 0 <= y < self.mesh_rows and 0 <= x < self.mesh_cols:
+                matrix[y, x] = count
+        
+        return matrix
     
     def get_total_buffer_occupancy_over_time(self) -> Tuple[List[int], List[int]]:
         """
@@ -314,82 +339,7 @@ class MetricsCollector:
         self._last_capture_cycle = -1
         self._last_completed = 0
         self._last_bytes = 0
-    
-    def _generate_host_to_noc_data(self, metrics: dict) -> None:
-        """
-        Generate synthetic snapshot data from saved Host-to-NoC metrics.
-        
-        This allows visualization charts to be generated without re-running
-        the simulation for Host-to-NoC modes.
-        
-        Args:
-            metrics: Saved metrics dictionary from latest.json.
-        """
-        import random
-        random.seed(42)
-        
-        cycles = metrics.get('cycles', 1000)
-        total_bytes = metrics.get('total_bytes', 10000)
-        num_transfers = metrics.get('num_transfers', 10)
-        
-        # Generate snapshots over the simulation timeline
-        num_snapshots = min(100, cycles // 10)
-        bytes_per_snapshot = total_bytes // max(num_snapshots, 1)
-        
-        for i in range(num_snapshots):
-            cycle = (i + 1) * (cycles // num_snapshots)
-            
-            # Create synthetic buffer occupancy with more granular values (0-8)
-            buffer_occupancy = {}
-            progress = i / num_snapshots  # 0.0 to 1.0
-            
-            for row in range(self.mesh_rows):
-                for col in range(self.mesh_cols):
-                    # Simulate realistic traffic patterns
-                    if col == 0:
-                        # Edge column: high during active transfers
-                        if progress < 0.1:
-                            occ = random.randint(0, 2)  # Ramp-up
-                        elif progress < 0.85:
-                            occ = random.randint(2, 8)  # Active
-                        else:
-                            occ = random.randint(0, 1)  # Drain
-                    elif col == 1:
-                        # Second column: medium utilization
-                        occ = random.randint(1, 5) if progress < 0.85 else 0
-                    else:
-                        # Inner columns: lower utilization
-                        occ = random.randint(0, 3) if progress < 0.8 else 0
-                    buffer_occupancy[(col, row)] = occ
-            
-            # Simulate throughput variation (ramp-up, plateau, ramp-down)
-            if progress < 0.1:
-                # Ramp-up phase
-                multiplier = progress / 0.1
-            elif progress < 0.85:
-                # Active phase with some variation
-                multiplier = 0.8 + random.uniform(-0.2, 0.2)
-            else:
-                # Drain phase
-                multiplier = max(0, (1.0 - progress) / 0.15)
-            
-            # Progressive bytes with variation
-            base_bytes = (i + 1) * bytes_per_snapshot
-            varied_bytes = int(base_bytes * (0.5 + multiplier * 0.5))
-            
-            snapshot = SimulationSnapshot(
-                cycle=cycle,
-                buffer_occupancy=buffer_occupancy,
-                flits_in_flight=random.randint(0, 16) if progress < 0.9 else random.randint(0, 3),
-                completed_transactions=min(num_transfers, int((i + 1) * num_transfers / num_snapshots)),
-                bytes_transferred=varied_bytes,
-                router_flit_counts={(col, row): random.randint(0, int(100 * multiplier) + 1) 
-                                   for row in range(self.mesh_rows) 
-                                   for col in range(self.mesh_cols)},
-                latencies=[random.randint(50, int(200 + 300 * (1 - multiplier))) for _ in range(5)],
-            )
-            self.snapshots.append(snapshot)
-    
+
     def __len__(self) -> int:
         """Number of snapshots collected."""
         return len(self.snapshots)

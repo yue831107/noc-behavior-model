@@ -652,6 +652,91 @@ class V1System:
 
     Optionally supports HostAXIMaster for DMA-style transfers.
     """
+    
+    @property
+    def current_cycle(self) -> int:
+        """Current simulation cycle."""
+        return self.current_time
+
+    @property
+    def mesh_dimensions(self) -> Tuple[int, int]:
+        """Return (cols, rows) of the mesh."""
+        return (self._mesh_cols, self._mesh_rows)
+
+    def get_buffer_occupancy(self) -> Dict[Tuple[int, int], int]:
+        """
+        Get flits in transit for each router in the mesh.
+
+        Counts all flits currently in the router:
+        - Input buffer occupancy
+        - Pending output signals (out_valid = True)
+        - Flits in pipeline stages (for multi-stage routers)
+
+        This provides accurate buffer utilization even in fast mode
+        where flits move through in a single cycle.
+        """
+        occupancy = {}
+        for coord, router in self.mesh.routers.items():
+            occ = 0
+            # Req router
+            for port in router.req_router.ports.values():
+                if hasattr(port, 'input_buffer'):
+                    occ += port.input_buffer.occupancy
+                # Count pending output (flit waiting to be accepted)
+                if port.out_valid and port.out_flit is not None:
+                    occ += 1
+            # Flits in pipeline stages
+            occ += router.req_router.flits_in_pipeline
+
+            # Resp router
+            for port in router.resp_router.ports.values():
+                if hasattr(port, 'input_buffer'):
+                    occ += port.input_buffer.occupancy
+                if port.out_valid and port.out_flit is not None:
+                    occ += 1
+            occ += router.resp_router.flits_in_pipeline
+
+            occupancy[coord] = occ
+        return occupancy
+
+    def get_flit_stats(self) -> Dict[Tuple[int, int], int]:
+        """Get flit forwarding stats for each router (req + resp)."""
+        stats = {}
+        for coord, router in self.mesh.routers.items():
+            count = router.req_router.stats.flits_forwarded
+            if hasattr(router, 'resp_router'):
+                count += router.resp_router.stats.flits_forwarded
+            stats[coord] = count
+        return stats
+
+    def get_transfer_stats(self) -> Tuple[int, int, int]:
+        """Get transfer completion statistics."""
+        if self.host_axi_master:
+            stats = self.host_axi_master.controller_stats
+            completed = stats.completed_transactions + stats.read_completed
+            bytes_transferred = stats.completed_bytes + stats.read_bytes_received
+
+            config = self.host_axi_master.transfer_config
+            from ..config import TransferMode
+            if config.transfer_mode in (TransferMode.BROADCAST, TransferMode.BROADCAST_READ):
+                size = config.src_size  # BROADCAST: 每個 node 收到完整數據
+            else:
+                size = config.src_size // max(1, len(config.get_target_node_list(16)))
+
+            return (completed, bytes_transferred, size)
+        return (0, 0, 0)
+
+    def set_packet_arrival_callback(self, callback: Callable[[int, int, int], None]) -> None:
+        """
+        Set callback for packet arrival notification.
+
+        Propagates callback to all MasterNIs in the mesh.
+
+        Args:
+            callback: Function that receives (packet_id, creation_time, arrival_time).
+        """
+        for ni in self.mesh.nis.values():
+            ni.set_packet_arrival_callback(callback)
 
     def __init__(
         self,
@@ -1024,7 +1109,7 @@ class V1System:
     def transfer_progress(self) -> float:
         """Get DMA transfer progress (0.0 - 1.0)."""
         if self.host_axi_master is None:
-            return 1.0
+            return 0.0  # No transfer configured yet
         return self.host_axi_master.progress
 
     def run_until_transfer_complete(self, max_cycles: int = 10000) -> int:
@@ -1194,6 +1279,83 @@ class NoCSystem:
     This system enables bidirectional communication between nodes using
     5 traffic patterns: neighbor, shuffle, bit_reverse, random, transpose.
     """
+    
+    @property
+    def mesh_dimensions(self) -> Tuple[int, int]:
+        """Return (cols, rows) of the mesh."""
+        return (self.mesh_cols, self.mesh_rows)
+
+    def get_buffer_occupancy(self) -> Dict[Tuple[int, int], int]:
+        """
+        Get flits in transit for each router in the mesh.
+
+        Counts all flits currently in the router:
+        - Input buffer occupancy
+        - Pending output signals (out_valid = True)
+        - Flits in pipeline stages (for multi-stage routers)
+
+        This provides accurate buffer utilization even in fast mode
+        where flits move through in a single cycle.
+        """
+        occupancy = {}
+        for coord, router in self.mesh.routers.items():
+            occ = 0
+            # Req router
+            for port in router.req_router.ports.values():
+                if hasattr(port, 'input_buffer'):
+                    occ += port.input_buffer.occupancy
+                # Count pending output (flit waiting to be accepted)
+                if port.out_valid and port.out_flit is not None:
+                    occ += 1
+            # Flits in pipeline stages
+            occ += router.req_router.flits_in_pipeline
+
+            # Resp router
+            for port in router.resp_router.ports.values():
+                if hasattr(port, 'input_buffer'):
+                    occ += port.input_buffer.occupancy
+                if port.out_valid and port.out_flit is not None:
+                    occ += 1
+            occ += router.resp_router.flits_in_pipeline
+
+            occupancy[coord] = occ
+        return occupancy
+
+    def get_flit_stats(self) -> Dict[Tuple[int, int], int]:
+        """Get flit forwarding stats for each router (req + resp)."""
+        stats = {}
+        for coord, router in self.mesh.routers.items():
+            count = router.req_router.stats.flits_forwarded
+            if hasattr(router, 'resp_router'):
+                count += router.resp_router.stats.flits_forwarded
+            stats[coord] = count
+        return stats
+
+    def get_transfer_stats(self) -> Tuple[int, int, int]:
+        """Get transfer completion statistics."""
+        completed = 0
+        for controller in self.node_controllers.values():
+            completed += controller.stats.transfers_completed
+        
+        bytes_transferred = 0
+        size = 0
+        if self._traffic_config:
+            size = self._traffic_config.transfer_size
+            bytes_transferred = completed * size
+            
+        return (completed, bytes_transferred, size)
+
+    def set_packet_arrival_callback(self, callback: Callable[[int, int, int], None]) -> None:
+        """
+        Set callback for packet arrival notification.
+
+        Propagates callback to all MasterNIs in the mesh.
+
+        Args:
+            callback: Function that receives (packet_id, creation_time, arrival_time).
+        """
+        for ni in self.mesh.nis.values():
+            ni.set_packet_arrival_callback(callback)
 
     def __init__(
         self,
@@ -1563,6 +1725,17 @@ class NoCSystem:
             for controller in self.node_controllers.values()
         )
 
+    @property
+    def transfer_progress(self) -> float:
+        """Get overall transfer progress (0.0 - 1.0)."""
+        if not self.node_controllers:
+            return 0.0
+        completed = sum(
+            1 for controller in self.node_controllers.values()
+            if controller.is_transfer_complete
+        )
+        return completed / len(self.node_controllers)
+
     def run_until_complete(self, max_cycles: int = 10000) -> int:
         """
         Run simulation until all transfers complete.
@@ -1678,82 +1851,4 @@ class NoCSystem:
             read_results[key] = actual_data
 
         return self.golden_manager.verify(read_results)
-
-    # =========================================================================
-    # MetricsProvider Protocol Implementation
-    # =========================================================================
-
-    @property
-    def mesh_dimensions(self) -> Tuple[int, int]:
-        """Return (cols, rows) of the mesh."""
-        return (self.mesh_cols, self.mesh_rows)
-
-    def get_buffer_occupancy(self) -> Dict[Tuple[int, int], int]:
-        """
-        Get buffer occupancy for each router.
-        
-        Returns:
-            Dict of (x, y) coordinate -> total buffer occupancy.
-        """
-        buffer_occupancy = {}
-        
-        for coord, router in self.mesh.routers.items():
-            occupancy = 0
-            
-            # Request router buffers
-            if hasattr(router, 'req_router'):
-                for port in router.req_router.ports.values():
-                    if hasattr(port, 'input_buffer'):
-                        occupancy += port.input_buffer.occupancy
-            
-            # Response router buffers
-            if hasattr(router, 'resp_router'):
-                for port in router.resp_router.ports.values():
-                    if hasattr(port, 'input_buffer'):
-                        occupancy += port.input_buffer.occupancy
-            
-            buffer_occupancy[coord] = occupancy
-        
-        return buffer_occupancy
-
-    def get_flit_stats(self) -> Dict[Tuple[int, int], int]:
-        """
-        Get flit forwarding stats for each router.
-        
-        Returns:
-            Dict of (x, y) coordinate -> flits forwarded count.
-        """
-        flit_stats = {}
-        
-        for coord, router in self.mesh.routers.items():
-            flit_count = 0
-            
-            if hasattr(router, 'req_router') and hasattr(router.req_router, 'stats'):
-                flit_count = router.req_router.stats.flits_forwarded
-            
-            flit_stats[coord] = flit_count
-        
-        return flit_stats
-
-    def get_transfer_stats(self) -> Tuple[int, int, int]:
-        """
-        Get transfer completion statistics.
-        
-        Returns:
-            Tuple of (completed_transactions, bytes_transferred, transfer_size).
-        """
-        completed = 0
-        
-        for controller in self.node_controllers.values():
-            if hasattr(controller, 'stats'):
-                completed += controller.stats.transfers_completed
-        
-        # Get transfer size from config
-        transfer_size = 0
-        if self._traffic_config:
-            transfer_size = self._traffic_config.transfer_size
-        
-        bytes_transferred = completed * transfer_size
-        
-        return (completed, bytes_transferred, transfer_size)
 

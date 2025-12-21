@@ -160,7 +160,7 @@ class MetricsStore:
         
         # Buffer occupancy as 3D array (snapshots, rows, cols)
         buffer_matrices = np.array([
-            collector.get_buffer_occupancy_matrix(i)
+            collector._get_raw_occupancy_matrix(i)
             for i in range(len(collector.snapshots))
         ])
         

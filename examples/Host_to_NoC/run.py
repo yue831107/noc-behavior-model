@@ -25,6 +25,115 @@ from src.core import V1System, HostMemory, Memory
 from src.config import load_transfer_config, load_transfer_configs, TransferConfig, TransferMode
 
 
+def save_host_metrics(
+    system: V1System,
+    configs: List[TransferConfig],
+    cycles: int,
+    success: bool,
+    verify_results: Optional[List[dict]] = None,
+    test_pattern: str = "single_transfer",
+    collector: Optional["MetricsCollector"] = None
+):
+    """Save simulation metrics to latest.json for visualization."""
+    import json
+    import statistics
+    from datetime import datetime
+
+    metrics_dir = Path("output/metrics")
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    total_bytes = sum(c.src_size for c in configs)
+    total_transfers = len(configs)
+
+    if verify_results:
+        total_pass = sum(r['pass'] for r in verify_results)
+        total_fail = sum(r['fail'] for r in verify_results)
+    else:
+        # Fallback for simple runs
+        total_pass = total_transfers if success else 0
+        total_fail = 0 if success else total_transfers
+
+    # Router flit statistics
+    flit_stats = system.get_flit_stats()
+    total_flits = sum(flit_stats.values())
+    active_routers = sum(1 for v in flit_stats.values() if v > 0)
+    avg_flits_per_router = total_flits / len(flit_stats) if flit_stats else 0
+    max_flits_router = max(flit_stats.values()) if flit_stats else 0
+
+    # Buffer utilization from collector
+    if collector:
+        buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
+        peak_buffer_util = max(buffer_occupancies) if buffer_occupancies else 0
+        avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
+        # Average during active periods (when flits are in flight)
+        active_occupancies = [x for x in buffer_occupancies if x > 0]
+        active_avg_buffer = sum(active_occupancies) / len(active_occupancies) if active_occupancies else 0
+        active_pct = len(active_occupancies) / len(buffer_occupancies) * 100 if buffer_occupancies else 0
+
+        # Latency statistics
+        latencies = collector.get_all_latencies()
+        if latencies:
+            min_latency = min(latencies)
+            max_latency = max(latencies)
+            avg_latency = statistics.mean(latencies)
+            std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+            latency_samples = len(latencies)
+        else:
+            min_latency = max_latency = std_latency = 0
+            avg_latency = cycles / total_transfers if total_transfers > 0 else 0
+            latency_samples = 0
+    else:
+        peak_buffer_util = avg_buffer_util = active_avg_buffer = active_pct = 0
+        min_latency = max_latency = std_latency = 0
+        avg_latency = cycles / total_transfers if total_transfers > 0 else 0
+        latency_samples = 0
+
+    metrics = {
+        'pattern': test_pattern,
+        'mode': 'host_to_noc',
+        'cycles': cycles,
+        'total_bytes': total_bytes,
+        'throughput': total_bytes / cycles if cycles > 0 else 0,
+        'num_transfers': total_transfers,
+        'completed_transfers': total_transfers if success else 0,
+        'pass_count': total_pass,
+        'fail_count': total_fail,
+        'success': success,
+        'timestamp': datetime.now().isoformat(),
+        'mesh_cols': system._mesh_cols if hasattr(system, '_mesh_cols') else 5,
+        'mesh_rows': system._mesh_rows if hasattr(system, '_mesh_rows') else 4,
+        'num_nodes': 16,
+        'transfer_size': total_bytes // total_transfers if total_transfers > 0 else 0,
+        # Router statistics
+        'total_flits': total_flits,
+        'active_routers': active_routers,
+        'avg_flits_per_router': avg_flits_per_router,
+        'max_flits_router': max_flits_router,
+        # Latency statistics
+        'latency_samples': latency_samples,
+        'min_latency': min_latency,
+        'max_latency': max_latency,
+        'avg_latency': avg_latency,
+        'std_latency': std_latency,
+        # Buffer utilization
+        'peak_buffer_util': peak_buffer_util,
+        'avg_buffer_util': avg_buffer_util,
+        'active_avg_buffer': active_avg_buffer,
+        'active_pct': active_pct,
+    }
+
+    # Include real snapshots if collector is provided
+    if collector and hasattr(collector, 'to_dict'):
+        metrics['snapshots'] = collector.to_dict()['snapshots']
+        print(f"  Real-time data: {len(metrics['snapshots'])} snapshots captured")
+
+    latest_path = metrics_dir / "latest.json"
+    with open(latest_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"\nMetrics saved: {latest_path}")
+
+
 def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: str = None) -> dict:
     """
     Run broadcast write test.
@@ -55,8 +164,10 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
         print("=" * 60)
         print(f"BIN file: {bin_file} ({len(bin_data)} bytes)")
 
-    # Create system
+    # Create system and collector
     system = V1System(mesh_cols=5, mesh_rows=4)
+    from src.visualization import MetricsCollector
+    collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
@@ -96,6 +207,7 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
     # Run simulation
     while completed < len(target_nodes) and cycle < max_cycles:
         system.process_cycle()
+        collector.capture()
 
         # Check responses
         while True:
@@ -122,16 +234,25 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
         # Verify
         print("\n--- Verification ---")
         pass_count, fail_count = system.verify_all_writes(verbose=True)
+        success = (fail_count == 0 and completed == len(target_nodes))
         if fail_count == 0:
             print("PASS: All data verified correctly")
         else:
             print(f"FAIL: {fail_count} verification failures")
 
+    # Save metrics
+    save_host_metrics(
+        system, [config], cycle, success, 
+        verify_results=[{'pass': pass_count, 'fail': fail_count}],
+        test_pattern='broadcast_write',
+        collector=collector
+    )
+
     return {
         'completed': completed,
         'total': len(target_nodes),
         'cycles': cycle,
-        'success': completed == len(target_nodes),
+        'success': success,
     }
 
 
@@ -165,8 +286,10 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
         print("=" * 60)
         print(f"BIN file: {bin_file} ({len(bin_data)} bytes)")
 
-    # Create system
+    # Create system and collector
     system = V1System(mesh_cols=5, mesh_rows=4)
+    from src.visualization import MetricsCollector
+    collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
 
     # Load test data from BIN file
     offset = config.read_src_addr % len(bin_data)
@@ -226,6 +349,7 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
 
     while completed < len(target_nodes) and cycle < 10000:
         system.process_cycle()
+        collector.capture()
 
         # Check read responses
         while True:
@@ -261,16 +385,25 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
                 fail_count += 1
                 print(f"  Node {node_id}: MISMATCH")
 
+        success = (fail_count == 0 and completed == len(target_nodes))
         if fail_count == 0:
             print(f"PASS: All {pass_count} nodes verified correctly")
         else:
             print(f"FAIL: {fail_count} verification failures")
 
+    # Save metrics
+    save_host_metrics(
+        system, [config], cycle, success,
+        verify_results=[{'pass': pass_count, 'fail': fail_count}],
+        test_pattern='broadcast_read',
+        collector=collector
+    )
+
     return {
         'completed': completed,
         'total': len(target_nodes),
         'cycles': cycle,
-        'success': completed == len(target_nodes),
+        'success': success,
     }
 
 
@@ -304,8 +437,10 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
         print("=" * 60)
         print(f"BIN file: {bin_file} ({len(bin_data)} bytes)")
 
-    # Create system
+    # Create system and collector
     system = V1System(mesh_cols=5, mesh_rows=4)
+    from src.visualization import MetricsCollector
+    collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
@@ -389,16 +524,25 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
                 fail_count += 1
                 print(f"  Node {node_id}: Golden mismatch")
 
+        success = (fail_count == 0 and completed == len(target_nodes))
         if fail_count == 0:
             print(f"PASS: All {pass_count} nodes have correct golden data")
         else:
             print(f"FAIL: {fail_count} golden mismatches")
 
+    # Save metrics
+    save_host_metrics(
+        system, [config], cycle, success,
+        verify_results=[{'pass': pass_count, 'fail': fail_count}],
+        test_pattern='scatter_write',
+        collector=collector
+    )
+
     return {
         'completed': completed,
         'total': len(target_nodes),
         'cycles': cycle,
-        'success': completed == len(target_nodes),
+        'success': success,
     }
 
 
@@ -432,8 +576,10 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
         print("=" * 60)
         print(f"BIN file: {bin_file} ({len(bin_data)} bytes)")
 
-    # Create system
+    # Create system and collector
     system = V1System(mesh_cols=5, mesh_rows=4)
+    from src.visualization import MetricsCollector
+    collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
 
     target_nodes = config.get_target_node_list(total_nodes=16)
     total_size = config.effective_read_size
@@ -471,6 +617,7 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
     cycle = 0
     while write_completed < len(target_nodes) and cycle < 5000:
         system.process_cycle()
+        collector.capture()
         while True:
             resp = system.master_ni.get_b_response()
             if resp is None:
@@ -512,6 +659,7 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
 
     while completed < len(target_nodes) and cycle < 10000:
         system.process_cycle()
+        collector.capture()
 
         while True:
             resp = system.master_ni.get_r_response()
@@ -545,24 +693,37 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
         print("\n--- Verification (HostMemory) ---")
         expected_golden = system.golden_manager.get_host_golden(host_dst_addr)
 
+        success = (gathered_result == expected_golden and completed == len(target_nodes))
         if gathered_result == expected_golden:
             print(f"PASS: Gathered {len(gathered_result)} bytes verified correctly")
             print(f"  Expected: {len(expected_golden)} bytes in HostMemory @ 0x{host_dst_addr:04X}")
+            pass_count = 1
+            fail_count = 0
         else:
             print(f"FAIL: Gathered data mismatch")
             print(f"  Expected: {len(expected_golden)} bytes")
             print(f"  Actual: {len(gathered_result)} bytes")
+            pass_count = 0
+            fail_count = 1
             # Find first mismatch
             for i in range(min(len(expected_golden), len(gathered_result))):
                 if expected_golden[i] != gathered_result[i]:
                     print(f"  First mismatch at offset {i}: expected 0x{expected_golden[i]:02X}, got 0x{gathered_result[i]:02X}")
                     break
 
+    # Save metrics
+    save_host_metrics(
+        system, [config], cycle, success,
+        verify_results=[{'pass': pass_count, 'fail': fail_count}],
+        test_pattern='gather_read',
+        collector=collector
+    )
+
     return {
         'completed': completed,
         'total': len(target_nodes),
         'cycles': cycle,
-        'success': completed == len(target_nodes),
+        'success': success,
     }
 
 
@@ -755,12 +916,16 @@ def run_multi_transfer(
         if verbose and fail_count > 0:
             print(f"  [Transfer {idx+1}] FAIL: {fail_count} mismatches")
 
-    # Create V1System
+    # Create V1System and collector
     system = V1System(
         mesh_cols=5,
         mesh_rows=4,
         host_memory=host_memory,
     )
+    from src.visualization import MetricsCollector
+    # Approximate capture interval based on avg transfer size
+    avg_size = sum(c.src_size for c in configs) // len(configs) if configs else 1024
+    collector = MetricsCollector(system, capture_interval=max(1, avg_size // 512))
 
     # Create HostAXIMaster with both callbacks
     first_config = configs[0]
@@ -803,6 +968,7 @@ def run_multi_transfer(
     
     while not system.host_axi_master.all_queue_transfers_complete and cycle < max_cycles:
         system.process_cycle()
+        collector.capture()
         cycle += 1
         
         if verbose and cycle % 1000 == 0:
@@ -854,49 +1020,78 @@ def run_multi_transfer(
             if total_fail > 10:
                 print(f"  ... and more failures")
         
+    # === Collect Performance Metrics ===
+    total_bytes = sum(c.src_size for c in configs)
+    throughput = total_bytes / cycle if cycle > 0 else 0
+
+    # Router flit statistics
+    flit_stats = system.get_flit_stats()
+    total_flits = sum(flit_stats.values())
+    active_routers = sum(1 for v in flit_stats.values() if v > 0)
+    avg_flits_per_router = total_flits / len(flit_stats) if flit_stats else 0
+    max_flits_router = max(flit_stats.values()) if flit_stats else 0
+
+    # Buffer utilization from collector
+    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
+    peak_buffer_util = max(buffer_occupancies) if buffer_occupancies else 0
+    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
+    # Average during active periods (when flits are in flight)
+    active_occupancies = [x for x in buffer_occupancies if x > 0]
+    active_avg_buffer = sum(active_occupancies) / len(active_occupancies) if active_occupancies else 0
+    active_pct = len(active_occupancies) / len(buffer_occupancies) * 100 if buffer_occupancies else 0
+
+    # Latency statistics from collector
+    latencies = collector.get_all_latencies()
+    if latencies:
+        import statistics
+        min_latency = min(latencies)
+        max_latency = max(latencies)
+        avg_latency = statistics.mean(latencies)
+        std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
+    else:
+        min_latency = max_latency = std_latency = 0
+        avg_latency = cycle / total if total > 0 else 0
+
+    if verbose:
+        print("\n--- Performance Metrics ---")
+        print(f"  Total Cycles:      {cycle}")
+        print(f"  Total Data:        {total_bytes} bytes")
+        print(f"  Throughput:        {throughput:.2f} bytes/cycle")
+
+        print("\n--- Router Statistics ---")
+        print(f"  Total Flits:       {total_flits}")
+        print(f"  Active Routers:    {active_routers}/{len(flit_stats)}")
+        print(f"  Avg Flits/Router:  {avg_flits_per_router:.1f}")
+        print(f"  Max Flits (router):{max_flits_router}")
+
+        print("\n--- Latency Distribution ---")
+        if latencies:
+            print(f"  Samples:           {len(latencies)}")
+            print(f"  Min Latency:       {min_latency} cycles")
+            print(f"  Max Latency:       {max_latency} cycles")
+            print(f"  Avg Latency:       {avg_latency:.2f} cycles")
+            print(f"  Std Dev:           {std_latency:.2f} cycles")
+        else:
+            print(f"  Avg Latency:       {avg_latency:.2f} cycles (estimated)")
+
+        print("\n--- Buffer Utilization ---")
+        print(f"  Peak Occupancy:    {peak_buffer_util} flits")
+        print(f"  Avg Occupancy:     {avg_buffer_util:.3f} flits")
+        print(f"  Active Avg:        {active_avg_buffer:.2f} flits ({active_pct:.1f}% of cycles active)")
+
         print()
         print("=" * 40)
         print(f"Overall Status: {'PASS' if overall_success else 'FAIL'}")
         print("=" * 40)
     
-    # Calculate metrics for visualization
-    total_bytes = sum(c.src_size for c in configs)
-    throughput = total_bytes / cycle if cycle > 0 else 0
-    avg_latency = cycle / total if total > 0 else 0
-    
-    # Save metrics to latest.json for visualization
-    import json
-    from datetime import datetime
-    
-    metrics_dir = Path("output/metrics")
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    
-    metrics = {
-        'pattern': 'multi_transfer',
-        'mode': 'host_to_noc',
-        'cycles': cycle,
-        'total_bytes': total_bytes,
-        'throughput': throughput,
-        'avg_latency': avg_latency,
-        'num_transfers': total,
-        'completed_transfers': completed,
-        'pass_count': total_pass,
-        'fail_count': total_fail,
-        'success': overall_success,
-        'timestamp': datetime.now().isoformat(),
-        'mesh_cols': 5,
-        'mesh_rows': 4,
-        'num_nodes': 16,
-        'transfer_size': sum(c.src_size for c in configs) // len(configs) if configs else 0,
-    }
-    
-    latest_path = metrics_dir / "latest.json"
-    with open(latest_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
-    
-    if verbose:
-        print(f"\nMetrics saved: {latest_path}")
-    
+    # Save metrics
+    save_host_metrics(
+        system, configs, cycle, overall_success,
+        verify_results=verify_results,
+        test_pattern='multi_transfer',
+        collector=collector
+    )
+
     return {
         'completed': completed,
         'total': total,

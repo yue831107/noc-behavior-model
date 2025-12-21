@@ -118,27 +118,41 @@ def _extract_metrics_legacy(system) -> Dict:
     else:
         mesh_rows = 4
     
-    # Get buffer occupancy
+    # Get buffer occupancy (flits in transit)
     buffer_occupancy = {}
     flit_stats = {}
-    
+
     if hasattr(system, 'mesh') and hasattr(system.mesh, 'routers'):
         for coord, router in system.mesh.routers.items():
             occupancy = 0
             flit_count = 0
-            
+
             if hasattr(router, 'req_router'):
                 for port in router.req_router.ports.values():
                     if hasattr(port, 'input_buffer'):
                         occupancy += port.input_buffer.occupancy
+                    # Count pending output signals
+                    if hasattr(port, 'out_valid') and port.out_valid:
+                        if hasattr(port, 'out_flit') and port.out_flit is not None:
+                            occupancy += 1
+                # Flits in pipeline stages
+                if hasattr(router.req_router, 'flits_in_pipeline'):
+                    occupancy += router.req_router.flits_in_pipeline
                 if hasattr(router.req_router, 'stats'):
                     flit_count = router.req_router.stats.flits_forwarded
-            
+
             if hasattr(router, 'resp_router'):
                 for port in router.resp_router.ports.values():
                     if hasattr(port, 'input_buffer'):
                         occupancy += port.input_buffer.occupancy
-            
+                    if hasattr(port, 'out_valid') and port.out_valid:
+                        if hasattr(port, 'out_flit') and port.out_flit is not None:
+                            occupancy += 1
+                if hasattr(router.resp_router, 'flits_in_pipeline'):
+                    occupancy += router.resp_router.flits_in_pipeline
+                if hasattr(router.resp_router, 'stats'):
+                    flit_count += router.resp_router.stats.flits_forwarded
+
             buffer_occupancy[coord] = occupancy
             flit_stats[coord] = flit_count
     
@@ -148,9 +162,19 @@ def _extract_metrics_legacy(system) -> Dict:
     transfer_size = 0
     
     if hasattr(system, 'host_axi_master') and system.host_axi_master:
-        stats = system.host_axi_master.stats
-        completed = stats.completed_transactions
-        bytes_transferred = stats.completed_bytes
+        master = system.host_axi_master
+        # Use controller_stats if available (more detailed)
+        if hasattr(master, 'controller_stats'):
+            c_stats = master.controller_stats
+            completed = c_stats.completed_transactions + c_stats.read_completed
+            bytes_transferred = c_stats.completed_bytes + c_stats.read_bytes_received
+        else:
+            # Fallback to HostAXIMasterStats
+            stats = master.stats
+            completed = getattr(stats, 'completed_transactions', 0)
+            if not completed:
+                completed = getattr(stats, 'b_received', 0) + getattr(stats, 'r_received', 0)
+            bytes_transferred = getattr(stats, 'completed_bytes', 0)
     elif hasattr(system, 'node_controllers'):
         for controller in system.node_controllers.values():
             if hasattr(controller, 'stats'):

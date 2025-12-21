@@ -262,36 +262,6 @@ def plot_router_comparison(
     return fig
 
 
-def plot_port_utilization_heatmap(
-    collector: "MetricsCollector",
-    save_path: Optional[str] = None,
-) -> Figure:
-    """
-    Plot port utilization as heatmap (Router × Direction).
-    
-    This requires router-level port statistics which may not be
-    available in basic MetricsCollector snapshots.
-    
-    Args:
-        collector: MetricsCollector with captured data.
-        save_path: Optional path to save the figure.
-    
-    Returns:
-        Matplotlib Figure object.
-    """
-    # Get per-router stats
-    stats = collector.get_per_router_stats()
-    
-    if not stats:
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.text(0.5, 0.5, "No port utilization data available",
-                ha='center', va='center', transform=ax.transAxes)
-        ax.set_title("Port Utilization Heatmap")
-        return fig
-    
-    # For now, show router comparison as simplified version
-    # Full port utilization requires additional stats collection
-    return plot_router_comparison(collector, metric="flits", save_path=save_path)
 
 
 def plot_combined_dashboard(
@@ -308,19 +278,20 @@ def plot_combined_dashboard(
     Returns:
         Matplotlib Figure object.
     """
-    fig = plt.figure(figsize=(16, 12))
+    fig = plt.figure(figsize=(16, 14))
     
-    # 2x2 grid of subplots
-    ax1 = fig.add_subplot(2, 2, 1)
-    ax2 = fig.add_subplot(2, 2, 2)
-    ax3 = fig.add_subplot(2, 2, 3)
-    ax4 = fig.add_subplot(2, 2, 4)
+    # 3x2 grid of subplots
+    ax1 = fig.add_subplot(3, 2, 1) # Throughput
+    ax2 = fig.add_subplot(3, 2, 2) # Transaction Progress
+    ax3 = fig.add_subplot(3, 2, 3) # Flit Count (Volume)
+    ax4 = fig.add_subplot(3, 2, 4) # Buffer Occupancy
+    ax5 = fig.add_subplot(3, 1, 3) # Router Utilization (Wide Bar Chart)
     
-    # Throughput
+    # 1. Throughput
     cycles, throughputs = collector.get_throughput_over_time()
     if cycles:
         ax1.plot(cycles, throughputs, color='steelblue', linewidth=1.5)
-        ax1.set_title("Throughput", fontweight='bold')
+        ax1.set_title("Throughput over Time", fontweight='bold')
         ax1.set_xlabel("Cycle")
         ax1.set_ylabel("Bytes/cycle")
         ax1.grid(True, alpha=0.3)
@@ -328,45 +299,62 @@ def plot_combined_dashboard(
         ax1.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax1.transAxes)
         ax1.set_title("Throughput")
     
-    # Buffer occupancy
-    cycles, occupancies = collector.get_total_buffer_occupancy_over_time()
+    # 2. Transaction Progress
+    cycles, progress = collector.get_transaction_progress_over_time()
     if cycles:
-        ax2.fill_between(cycles, occupancies, alpha=0.3, color='coral')
-        ax2.plot(cycles, occupancies, color='coral', linewidth=1.5)
-        ax2.set_title("Buffer Utilization", fontweight='bold')
+        ax2.fill_between(cycles, progress, alpha=0.2, color='green')
+        ax2.plot(cycles, progress, color='green', linewidth=1.5)
+        ax2.set_title("Transaction Progress", fontweight='bold')
         ax2.set_xlabel("Cycle")
-        ax2.set_ylabel("Total Flits in Buffers")
+        ax2.set_ylabel("Completed Transcations")
         ax2.grid(True, alpha=0.3)
     else:
         ax2.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax2.transAxes)
-        ax2.set_title("Buffer Utilization")
+        ax2.set_title("Progress")
     
-    # Flit count
+    # 3. Flit Count (Volume Curve)
     cycles, flits = collector.get_flit_count_over_time()
     if cycles:
-        ax3.plot(cycles, flits, color='green', linewidth=1.5)
-        ax3.set_title("Flit Count", fontweight='bold')
+        ax3.plot(cycles, flits, color='teal', linewidth=1.5)
+        ax3.set_title("Traffic Volume (Cumulative Flits)", fontweight='bold')
         ax3.set_xlabel("Cycle")
         ax3.set_ylabel("Total Flits")
         ax3.grid(True, alpha=0.3)
     else:
         ax3.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax3.transAxes)
-        ax3.set_title("Flit Count")
+        ax3.set_title("Volume")
     
-    # Transaction progress
-    cycles, progress = collector.get_transaction_progress_over_time()
+    # 4. Buffer Utilization (Occupancy)
+    cycles, occupancies = collector.get_total_buffer_occupancy_over_time()
     if cycles:
-        ax4.plot(cycles, progress, color='purple', linewidth=1.5)
-        ax4.set_title("Transaction Progress", fontweight='bold')
+        ax4.fill_between(cycles, occupancies, alpha=0.3, color='coral')
+        ax4.plot(cycles, occupancies, color='coral', linewidth=1.5)
+        ax4.set_title("Mesh Buffer Occupancy (Congestion)", fontweight='bold')
         ax4.set_xlabel("Cycle")
-        ax4.set_ylabel("Completed")
+        ax4.set_ylabel("Flits in Buffers")
         ax4.grid(True, alpha=0.3)
     else:
         ax4.text(0.5, 0.5, "No data", ha='center', va='center', transform=ax4.transAxes)
-        ax4.set_title("Transaction Progress")
+        ax4.set_title("Buffer Occupancy")
     
-    plt.suptitle("NoC Simulation Dashboard", fontsize=16, fontweight='bold')
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    # 5. Router Utilization (Bar Chart)
+    stats = collector.get_per_router_stats()
+    if stats:
+        sorted_coords = sorted(stats.keys())
+        labels = [f"({x},{y})" for x, y in sorted_coords]
+        values = [stats[c]['flits_forwarded'] for c in sorted_coords]
+        
+        ax5.bar(labels, values, color='steelblue', alpha=0.8)
+        ax5.set_title("Per-Router Total Utilization (Workload Distribution)", fontweight='bold')
+        ax5.set_ylabel("Total Flits Forwarded")
+        ax5.grid(True, alpha=0.3, axis='y')
+        if len(labels) > 10:
+            plt.setp(ax5.get_xticklabels(), rotation=45, ha='right')
+    else:
+        ax5.text(0.5, 0.5, "No Data", ha='center', va='center', transform=ax5.transAxes)
+    
+    plt.suptitle("NoC Performance Analysis Dashboard (Simulation Results)", fontsize=18, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     
     if save_path:
         from pathlib import Path

@@ -1,12 +1,12 @@
 """
-Buffer Occupancy Heatmap Visualization.
+Heatmap Visualizations for NoC.
 
-Displays mesh router buffer occupancy as a color-coded heatmap.
+Includes buffer occupancy and router utilization heatmaps.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -21,19 +21,16 @@ if TYPE_CHECKING:
 class BufferHeatmapConfig:
     """Configuration for buffer heatmap visualization."""
     
-    title: str = "Buffer Occupancy Heatmap"
-    cmap: str = "YlOrRd"  # Yellow -> Orange -> Red
-    show_values: bool = True
-    show_colorbar: bool = True
+    title: str = "NoC Buffer Occupancy Heatmap"
+    cmap: str = "YlOrRd"  # Yellow-Orange-Red
     figsize: Tuple[int, int] = (10, 8)
-    # Value format string for annotations
-    value_format: str = "{:.0f}"
-    # Edge column marking
-    mark_edge_column: bool = True
-    edge_column: int = 0
-    # Axis labels
-    xlabel: str = "Column"
-    ylabel: str = "Row"
+    # Range for color scale (auto if None)
+    vmin: Optional[float] = 0
+    vmax: Optional[float] = None
+    # Grid lines
+    show_grid: bool = True
+    grid_color: str = 'gray'
+    grid_alpha: float = 0.3
 
 
 def plot_buffer_heatmap(
@@ -41,15 +38,17 @@ def plot_buffer_heatmap(
     config: Optional[BufferHeatmapConfig] = None,
     save_path: Optional[str] = None,
     snapshot_index: int = -1,
+    use_average: bool = False,
 ) -> Figure:
     """
-    Plot buffer occupancy heatmap.
+    Plot 2D heatmap of buffer occupancy.
     
     Args:
         collector: MetricsCollector with captured data.
         config: Visualization configuration.
         save_path: Optional path to save the figure.
-        snapshot_index: Which snapshot to visualize (-1 = latest).
+        snapshot_index: Index of snapshot to plot (-1 for latest).
+        use_average: If True, plots average occupancy across all snapshots.
     
     Returns:
         Matplotlib Figure object.
@@ -57,79 +56,56 @@ def plot_buffer_heatmap(
     if config is None:
         config = BufferHeatmapConfig()
     
-    # Get buffer occupancy matrix
-    matrix = collector.get_buffer_occupancy_matrix(snapshot_index)
-    
-    # Get cycle number for title
-    if collector.snapshots:
-        cycle = collector.snapshots[snapshot_index].cycle
-        title = f"{config.title} (Cycle {cycle})"
+    # Get matrix
+    if use_average:
+        _, data = collector.get_buffer_occupancy_over_time()
+        if data.size == 0:
+            matrix = np.zeros((collector.mesh_rows, collector.mesh_cols))
+        else:
+            matrix = np.mean(data, axis=0)
     else:
-        title = config.title
+        matrix = collector._get_raw_occupancy_matrix(snapshot_index)
     
-    # Create figure
     fig, ax = plt.subplots(figsize=config.figsize)
     
-    # Determine vmax for consistent color scaling
-    # Use fixed max for consistent appearance across visualizations
-    vmax = max(8, int(np.ceil(matrix.max()))) if matrix.max() > 0 else 8
-    
-    # Plot heatmap with fixed scale for smooth color gradients
     im = ax.imshow(
         matrix,
         cmap=config.cmap,
-        aspect='auto',
-        origin='lower',  # Row 0 at bottom
-        vmin=0,
-        vmax=vmax,
-        interpolation='nearest',  # Sharp edges for grid cells
+        interpolation='nearest',
+        origin='lower',
+        vmin=config.vmin,
+        vmax=config.vmax,
     )
     
-    # Add colorbar with more ticks for granularity
-    if config.show_colorbar:
-        cbar = fig.colorbar(im, ax=ax, label='Buffer Occupancy')
-        cbar.set_ticks(np.arange(0, vmax + 1, max(1, vmax // 8)))
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Flits' if not use_average else 'Average Flits')
     
-    # Add value annotations
-    if config.show_values:
-        for y in range(matrix.shape[0]):
-            for x in range(matrix.shape[1]):
-                value = matrix[y, x]
-                # Skip edge column if marked
-                if config.mark_edge_column and x == config.edge_column:
-                    text = "--"
-                    color = 'gray'
-                else:
-                    text = config.value_format.format(value)
-                    # Choose text color based on background
-                    color = 'white' if value > matrix.max() * 0.6 else 'black'
-                
-                ax.text(
-                    x, y, text,
-                    ha='center', va='center',
-                    color=color, fontsize=10,
-                )
+    # Add labels
+    ax.set_title(config.title, fontsize=14, fontweight='bold')
+    ax.set_xlabel('Mesh X (Columns)')
+    ax.set_ylabel('Mesh Y (Rows)')
     
-    # Set labels and title
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.set_xlabel(config.xlabel)
-    ax.set_ylabel(config.ylabel)
+    # Set ticks
+    ax.set_xticks(np.arange(collector.mesh_cols))
+    ax.set_yticks(np.arange(collector.mesh_rows))
     
-    # Set tick labels
-    ax.set_xticks(range(matrix.shape[1]))
-    ax.set_yticks(range(matrix.shape[0]))
+    # Add text labels on each cell
+    for y in range(collector.mesh_rows):
+        for x in range(collector.mesh_cols):
+            val = matrix[y, x]
+            label = f"{val:.1f}" if use_average else f"{int(val)}"
+            ax.text(x, y, label, ha='center', va='center', 
+                    color='black' if val < (matrix.max() / 2) else 'white')
     
-    # Mark edge column in label
-    if config.mark_edge_column:
-        xlabels = [
-            f"Edge" if i == config.edge_column else str(i)
-            for i in range(matrix.shape[1])
-        ]
-        ax.set_xticklabels(xlabels)
-    
+    if config.show_grid:
+        ax.set_xticks(np.arange(-.5, collector.mesh_cols, 1), minor=True)
+        ax.set_yticks(np.arange(-.5, collector.mesh_rows, 1), minor=True)
+        ax.grid(which='minor', color=config.grid_color, linestyle='-', alpha=config.grid_alpha)
+        ax.tick_params(which='minor', bottom=False, left=False)
+
     plt.tight_layout()
     
-    # Save if path provided
     if save_path:
         from pathlib import Path
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
@@ -138,38 +114,64 @@ def plot_buffer_heatmap(
     return fig
 
 
-def plot_buffer_occupancy_animation_frame(
-    ax,
-    matrix: np.ndarray,
-    config: BufferHeatmapConfig,
-    cycle: int,
-) -> None:
+def plot_utilization_heatmap(
+    collector: "MetricsCollector",
+    save_path: Optional[str] = None,
+    snapshot_index: int = -1,
+) -> Figure:
     """
-    Plot a single frame for animation (used by animation.py).
+    Plot 2D heatmap of router utilization (flits forwarded).
     
     Args:
-        ax: Matplotlib axes to plot on.
-        matrix: Buffer occupancy matrix.
-        config: Visualization configuration.
-        cycle: Current cycle number.
+        collector: MetricsCollector with captured data.
+        save_path: Optional path to save the figure.
+        snapshot_index: Snapshot index to use.
+    
+    Returns:
+        Matplotlib Figure object.
     """
-    ax.clear()
+    matrix = collector.get_utilization_matrix(snapshot_index)
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
     
     im = ax.imshow(
         matrix,
-        cmap=config.cmap,
-        aspect='auto',
+        cmap="Blues",
+        interpolation='nearest',
         origin='lower',
-        vmin=0,
-        vmax=16,  # Assume max buffer depth
     )
     
-    ax.set_title(f"{config.title} (Cycle {cycle})")
-    ax.set_xlabel(config.xlabel)
-    ax.set_ylabel(config.ylabel)
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Total Flits Forwarded')
     
-    # Set tick labels
-    ax.set_xticks(range(matrix.shape[1]))
-    ax.set_yticks(range(matrix.shape[0]))
+    # Add labels
+    ax.set_title("Router Utilization Heatmap (Cumulative Flit Count)", fontsize=14, fontweight='bold')
+    ax.set_xlabel('Mesh X (Columns)')
+    ax.set_ylabel('Mesh Y (Rows)')
     
-    return im
+    # Set ticks
+    ax.set_xticks(np.arange(collector.mesh_cols))
+    ax.set_yticks(np.arange(collector.mesh_rows))
+    
+    # Add text labels on each cell
+    for y in range(collector.mesh_rows):
+        for x in range(collector.mesh_cols):
+            val = matrix[y, x]
+            ax.text(x, y, f"{int(val)}", ha='center', va='center',
+                    color='black' if val < (matrix.max() / 1.5) else 'white')
+    
+    # Grid
+    ax.set_xticks(np.arange(-.5, collector.mesh_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, collector.mesh_rows, 1), minor=True)
+    ax.grid(which='minor', color='gray', linestyle='-', alpha=0.3)
+    ax.tick_params(which='minor', bottom=False, left=False)
+
+    plt.tight_layout()
+    
+    if save_path:
+        from pathlib import Path
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    
+    return fig

@@ -60,6 +60,7 @@ class NIConfig:
     # Buffer depths
     req_buffer_depth: int = 8       # Request output buffer depth
     resp_buffer_depth: int = 8      # Response input buffer depth
+    r_queue_depth: int = 64         # Max R beats in AXISlave response queue (backpressure)
 
     # Flit parameters
     # Must be >= PACKET_HEADER_SIZE (12 bytes) + reasonable data
@@ -890,6 +891,12 @@ class AXISlave:
         self._b_queue: Deque[AXI_B] = deque()
         self._r_queue: Deque[AXI_R] = deque()
 
+        # Backpressure configuration
+        self._max_r_queue_depth = self.config.r_queue_depth
+
+        # Pending AR requests (deferred due to backpressure)
+        self._pending_ar: Deque[AXI_AR] = deque()
+
         # Statistics
         self.stats = NIStats()
 
@@ -961,17 +968,25 @@ class AXISlave:
         """
         Accept AXI Read Address.
 
+        With backpressure: if _r_queue is full, the AR is queued
+        in _pending_ar and will be processed when space is available.
+
         Args:
             ar: Read address request.
 
         Returns:
-            True if accepted.
+            True if accepted (always accepts, may defer processing).
         """
         self._ar_queue.append(ar)
         self.stats.ar_received += 1
 
-        # Process read immediately (single-cycle for simplicity)
-        self._process_read(ar)
+        # Check backpressure: if R queue has space, process immediately
+        if len(self._r_queue) < self._max_r_queue_depth:
+            self._process_read(ar)
+        else:
+            # Backpressure: defer processing until space is available
+            self._pending_ar.append(ar)
+
         return True
 
     def _process_read(self, ar: AXI_AR) -> None:
@@ -1039,9 +1054,30 @@ class AXISlave:
         """Check if R responses are pending."""
         return len(self._r_queue) > 0
 
+    def is_r_queue_full(self) -> bool:
+        """Check if R queue is at capacity (backpressured)."""
+        return len(self._r_queue) >= self._max_r_queue_depth
+
+    @property
+    def r_queue_occupancy(self) -> int:
+        """Current R queue occupancy."""
+        return len(self._r_queue)
+
+    @property
+    def pending_ar_count(self) -> int:
+        """Number of AR requests waiting due to backpressure."""
+        return len(self._pending_ar)
+
     def process_cycle(self, current_time: int = 0) -> None:
-        """Process one cycle (for latency modeling if needed)."""
-        pass  # Currently processes immediately
+        """
+        Process one cycle.
+
+        Handles deferred AR requests when R queue has space (backpressure release).
+        """
+        # Process pending AR requests if R queue has space
+        while self._pending_ar and len(self._r_queue) < self._max_r_queue_depth:
+            ar = self._pending_ar.popleft()
+            self._process_read(ar)
 
     # === Direct Memory Access (for initialization/debug) ===
 
@@ -1231,6 +1267,10 @@ class MasterNI:
         # Queue for flits waiting to be sent (Wormhole: one flit per cycle)
         self._pending_flits: Deque[Flit] = deque()
 
+        # Packet arrival callback for metrics collection
+        # Called with (packet_id, creation_time, arrival_time) when a packet arrives
+        self._packet_arrival_callback: Optional[Callable[[int, int, int], None]] = None
+
         # === Valid/Ready Interface Signals ===
         # Request input (Router LOCAL → NI)
         self.req_in_valid: bool = False
@@ -1296,6 +1336,17 @@ class MasterNI:
         """Clear input signals after sampling."""
         self.req_in_valid = False
         self.req_in_flit = None
+
+    # === Packet Arrival Callback ===
+
+    def set_packet_arrival_callback(self, callback: Callable[[int, int, int], None]) -> None:
+        """
+        Set callback for packet arrival notification.
+
+        Args:
+            callback: Function that receives (packet_id, creation_time, arrival_time).
+        """
+        self._packet_arrival_callback = callback
 
     # === NoC Interface (Legacy) ===
 
@@ -1365,6 +1416,10 @@ class MasterNI:
         Converts packet to AXI request, stores info in Per-ID FIFO,
         and forwards to Memory.
         """
+        # Notify packet arrival for metrics collection
+        if self._packet_arrival_callback:
+            self._packet_arrival_callback(packet.packet_id, packet.timestamp, current_time)
+
         # Store request info in Per-ID FIFO for response routing
         req_info = MasterNI_RequestInfo(
             packet_id=packet.packet_id,

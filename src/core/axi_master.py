@@ -520,7 +520,7 @@ class AXIMasterController:
     def get_progress(self) -> float:
         """Get transfer progress (0.0 - 1.0)."""
         if self.stats.total_bytes == 0:
-            return 1.0
+            return 0.0  # No transfer configured yet
         return self.stats.completed_bytes / self.stats.total_bytes
 
     def get_summary(self) -> Dict:
@@ -847,5 +847,5 @@ class AXIMasterController:
     def get_read_progress(self) -> float:
         """Get read transfer progress (0.0 - 1.0)."""
         if self.stats.read_bytes_requested == 0:
-            return 1.0
+            return 0.0  # No read transfer configured yet
         return self.stats.read_bytes_received / self.stats.read_bytes_requested
