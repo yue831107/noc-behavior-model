@@ -1,0 +1,23 @@
+{
+  "language": "敘述使用繁體中文，術語使用英文",
+  "permissions": {
+    "allow": [
+      "Bash(py -3 -m pytest*)",
+      "Bash(make *)",
+      "Bash(python *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3 -m pytest tests/unit/ -q --tb=no 2>&1 | tail -5"
+          }
+        ]
+      }
+    ]
+  }
+}
