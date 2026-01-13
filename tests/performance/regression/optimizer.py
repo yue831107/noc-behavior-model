@@ -249,8 +249,8 @@ class ParameterOptimizer:
                 "total_bytes": total_bytes,
             }
 
-        except Exception:
-            # Fallback to theoretical mock
+        except (ImportError, RuntimeError, ValueError, KeyError) as e:
+            # Fallback to theoretical mock when simulation unavailable
             return self._mock_simulation(params, workload)
 
     def _run_noc_to_noc(
@@ -339,8 +339,8 @@ class ParameterOptimizer:
                 "num_nodes": num_nodes,
             }
 
-        except Exception:
-            # Fallback to theoretical mock
+        except (ImportError, RuntimeError, ValueError, KeyError) as e:
+            # Fallback to theoretical mock when simulation unavailable
             return self._mock_simulation(params, workload)
 
     def _mock_simulation(

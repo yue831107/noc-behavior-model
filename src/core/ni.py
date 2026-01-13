@@ -43,6 +43,10 @@ from ..axi.interface import (
 from ..address.address_map import SystemAddressMap, AddressTranslator
 
 
+# Constants for AXI transfer sizing
+DEFAULT_BEAT_SIZE_BYTES = 8  # Default beat size for AXI transfers (corresponds to AXISize.SIZE_8)
+
+
 @dataclass
 class NIConfig:
     """Network Interface configuration."""
@@ -1470,7 +1474,7 @@ class MasterNI:
             read_size = 8
 
         # Calculate burst length from read_size
-        beat_size = 8  # AXISize.SIZE_8
+        beat_size = DEFAULT_BEAT_SIZE_BYTES
         num_beats = (read_size + beat_size - 1) // beat_size
         arlen = num_beats - 1  # AXI arlen is num_beats - 1
 

@@ -488,7 +488,7 @@ NoC-to-NoC Examples (per-node files):
                 if args.hex_dump:
                     print(f"  Hex dump: {Path(args.output).with_suffix('.hex')}")
 
-    except Exception as e:
+    except (ValueError, OSError, IOError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

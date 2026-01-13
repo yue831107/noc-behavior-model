@@ -256,7 +256,7 @@ def run_host_to_noc_test(config: TestConfig, verbose: bool = False) -> TestResul
         # Data verification
         result.data_verified = (completed == len(target_nodes))
 
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, KeyError) as e:
         result.validation_passed = False
         result.validation_errors.append(f"Exception: {str(e)}")
 
@@ -362,7 +362,7 @@ def run_noc_to_noc_test(config: TestConfig, verbose: bool = False) -> TestResult
         report = system.verify_transfers()
         result.data_verified = (report.failed == 0)
 
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, KeyError) as e:
         result.validation_passed = False
         result.validation_errors.append(f"Exception: {str(e)}")
 

@@ -329,7 +329,7 @@ def run_host_to_noc_sweep(
         result.buffer_avg = buffer_stats['avg']
         result.buffer_utilization = buffer_stats['utilization']
 
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, KeyError) as e:
         print(f"  Error: {e}")
 
     return result
@@ -421,7 +421,7 @@ def run_noc_to_noc_sweep(
         result.buffer_avg = buffer_stats['avg']
         result.buffer_utilization = buffer_stats['utilization']
 
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, KeyError) as e:
         print(f"  Error: {e}")
 
     return result

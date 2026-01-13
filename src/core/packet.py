@@ -183,7 +183,7 @@ class PacketAssembler:
                 # Calculate strb mask based on actual valid bytes
                 # strb bit i = 1 means byte i is valid
                 if valid_bytes >= self.flit_payload_size:
-                    strb = 0xFFFFFFFF  # All 32 bytes valid
+                    strb = (1 << self.flit_payload_size) - 1  # All bytes valid
                 else:
                     # Only first valid_bytes are valid
                     strb = (1 << valid_bytes) - 1

@@ -1090,7 +1090,7 @@ def run_multi_transfer(
                                     f"got=0x{actual_data[off]:02X})"
                                 )
                                 break
-                except Exception as e:
+                except (KeyError, IndexError, ValueError) as e:
                     fail_count += 1
                     details.append(f"Node {node_id}: Error - {e}")
         

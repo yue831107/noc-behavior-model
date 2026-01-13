@@ -202,7 +202,7 @@ def main():
             report.plot_latency_vs_throughput(
                 save_path=args.output / "latency_vs_throughput.png"
             )
-        except Exception as e:
+        except (ImportError, OSError, ValueError) as e:
             print(f"Warning: Could not generate plots: {e}")
 
     # Print final summary

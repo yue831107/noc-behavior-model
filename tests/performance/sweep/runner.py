@@ -121,7 +121,7 @@ class SweepRunner:
                 return self._run_noc_to_noc(params)
             else:
                 return self._run_host_to_noc(params)
-        except Exception as e:
+        except (ImportError, RuntimeError, ValueError, KeyError) as e:
             if self.verbose:
                 print(f"  Warning: Simulation failed - {e}")
             return self._generate_mock_metrics(params)
