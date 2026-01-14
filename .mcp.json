@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "booksim2": {
+      "command": "python",
+      "args": ["mcp-servers/booksim2/server.py"],
+      "env": {
+        "BOOKSIM_PATH": "${BOOKSIM_PATH:-booksim}"
+      }
+    }
+  }
+}
