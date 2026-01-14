@@ -20,11 +20,21 @@
 目前的架構設計，將 5 個 AXI channel 合併到 2 條 physical channel：
 
 ```
-Router Port (每方向)
-├── Request Channel ←→ 承載 AW, W, AR (multiplexed)
-└── Response Channel ←→ 承載 B, R (multiplexed)
+                    ┌─────────────────────────────────────────┐
+                    │            Combined Router              │
+                    │                                         │
+          N ────────┤  ┌─────────────────────────────────┐   │
+          S ────────┤  │         ReqRouter (5×5)         │   │──── 處理 AW, W, AR
+          E ────────┤  │    (Request Sub-Router)         │   │
+          W ────────┤  └─────────────────────────────────┘   │
+          Local ────┤                                         │
+                    │  ┌─────────────────────────────────┐   │
+                    │  │        RespRouter (5×5)         │   │──── 處理 B, R
+                    │  │    (Response Sub-Router)        │   │
+                    └──┴─────────────────────────────────┴───┘
 
 Physical Wires per Direction: 4 條 (Req in/out + Resp in/out)
+Sub-Router 數量: 2 個
 ```
 
 **特點**：
@@ -37,14 +47,18 @@ Physical Wires per Direction: 4 條 (Req in/out + Resp in/out)
 將每個 AXI channel 獨立成一條 physical channel：
 
 ```
-Router Port (每方向)
-├── AW Channel ←→ Write Address (獨立)
-├── W Channel  ←→ Write Data (獨立)
-├── AR Channel ←→ Read Address (獨立)
-├── B Channel  ←→ Write Response (獨立)
-└── R Channel  ←→ Read Data (獨立)
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                    Combined Router                       │
+                    │                                                          │
+          N ────────┤  ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌───────┐     │
+          S ────────┤  │  AW   │ │   W   │ │  AR   │ │   B   │ │   R   │     │
+          E ────────┤  │Router │ │Router │ │Router │ │Router │ │Router │     │
+          W ────────┤  │ (5×5) │ │ (5×5) │ │ (5×5) │ │ (5×5) │ │ (5×5) │     │
+          Local ────┤  └───────┘ └───────┘ └───────┘ └───────┘ └───────┘     │
+                    └─────────────────────────────────────────────────────────┘
 
 Physical Wires per Direction: 10 條 (5 channels × in/out)
+Sub-Router 數量: 5 個
 ```
 
 **特點**：
@@ -272,7 +286,7 @@ Physical Wires per Direction: 10 條 (5 channels × in/out)
 | **每方向線寬** | 1,196 bits | 1,530 bits | +28% |
 | **5-port Router 總線寬** | 5,980 bits | 7,650 bits | +28% |
 | **Wire 數量/方向** | 4 條 | 10 條 | +150% |
-| **Crossbar 數量** | 2 個 5×5 | 5 個 5×5 | +150% |
+| **Sub-Router 數量** | 2 個 (Req+Resp) | 5 個 (AW+W+AR+B+R) | +150% |
 | **Arbiter 數量** | 10 個 | 25 個 | +150% |
 
 ### Payload 利用率分析
@@ -312,7 +326,7 @@ Physical Wires per Direction: 10 條 (5 channels × in/out)
 | 優點 | 說明 |
 |------|------|
 | ✅ **線寬較小** | 每方向 1,196 bits vs 1,530 bits (-28%) |
-| ✅ **Crossbar 簡單** | 只需 2 個 5×5 crossbar |
+| ✅ **Router 結構簡單** | 只需 2 個 Sub-Router (ReqRouter + RespRouter) |
 | ✅ **Arbiter 較少** | 10 個 vs 25 個 (-60%) |
 | ✅ **設計驗證簡單** | 較少的 channel 意味著較少的邊界情況 |
 | ✅ **功耗較低** | 較少的 wire 和控制邏輯 |
@@ -346,7 +360,7 @@ Physical Wires per Direction: 10 條 (5 channels × in/out)
 | 缺點 | 說明 |
 |------|------|
 | ❌ **線寬增加** | 每方向 +334 bits (+28%) |
-| ❌ **Crossbar 複雜** | 需要 5 個 5×5 crossbar (+150%) |
+| ❌ **Router 結構複雜** | 需要 5 個 Sub-Router (AW/W/AR/B/R) (+150%) |
 | ❌ **Arbiter 增加** | 25 個 vs 10 個 (+150%) |
 | ❌ **面積增加** | Router 面積約增加 40-60% |
 | ❌ **功耗增加** | 更多 wire 和控制邏輯 |
