@@ -43,6 +43,7 @@ from .router import (
     EdgeRouter,
     PortWire,
     create_router,
+    create_channel_router,
 )
 from .channel_mode_strategy import (
     ChannelModeStrategy,
@@ -155,6 +156,7 @@ __all__ = [
     "EdgeRouter",
     "PortWire",
     "create_router",
+    "create_channel_router",
     # Channel Mode Strategy
     "ChannelModeStrategy",
     "GeneralModeStrategy",

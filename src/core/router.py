@@ -1410,6 +1410,53 @@ def create_router(
 # AXI Mode Channel-Specific Sub-Routers
 # =============================================================================
 
+# Channel name mapping for factory
+_CHANNEL_NAMES = {
+    AxiChannel.AW: "AW",
+    AxiChannel.W: "W",
+    AxiChannel.AR: "AR",
+    AxiChannel.B: "B",
+    AxiChannel.R: "R",
+}
+
+
+def create_channel_router(
+    channel: AxiChannel,
+    coord: Tuple[int, int],
+    config: Optional[RouterConfig] = None,
+    name: str = ""
+) -> XYRouter:
+    """
+    Factory function to create a channel-specific XYRouter for AXI Mode.
+
+    This is the recommended way to create AXI channel routers.
+    Individual channel router classes (AWRouter, WRouter, etc.) are
+    retained for backward compatibility.
+
+    Args:
+        channel: AXI channel type (AW, W, AR, B, R).
+        coord: Router coordinate (x, y).
+        config: Optional router configuration.
+        name: Optional router name.
+
+    Returns:
+        XYRouter instance with axi_channel attribute set.
+
+    Example:
+        >>> aw_router = create_channel_router(AxiChannel.AW, (1, 2))
+        >>> aw_router.axi_channel
+        <AxiChannel.AW: 0>
+    """
+    ch_name = _CHANNEL_NAMES.get(channel, "Unknown")
+    name = name or f"{ch_name}Router({coord[0]},{coord[1]})"
+    router = XYRouter(coord, config, name)
+    router.axi_channel = channel
+    return router
+
+
+# Legacy class definitions - kept for backward compatibility
+# New code should use create_channel_router() instead
+
 class AWRouter(XYRouter):
     """
     AW (Write Address) Channel Router for AXI Mode.
