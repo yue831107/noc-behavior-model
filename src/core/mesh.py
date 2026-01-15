@@ -128,6 +128,9 @@ class Mesh:
         self._b_wires: List[PortWire] = []
         self._r_wires: List[PortWire] = []
 
+        # Unified wire list (populated after connection)
+        self._all_wires: List[PortWire] = []
+
         # Statistics
         self.stats = MeshStats()
 
@@ -135,6 +138,9 @@ class Mesh:
         self._build_mesh()
         self._connect_routers()
         self._connect_nis()
+
+        # Build unified wire list for efficient iteration
+        self._build_unified_wire_list()
 
     def _build_mesh(self) -> None:
         """Create all routers and NIs."""
@@ -328,6 +334,25 @@ class Mesh:
                 ni._router_req_port = ni_req_port
                 ni._router_resp_port = ni_resp_port
 
+    def _build_unified_wire_list(self) -> None:
+        """
+        Build unified wire list for efficient iteration.
+
+        This enables single-loop iteration over all wires in
+        _propagate_all_wires() and _handle_credit_release(),
+        regardless of channel mode.
+        """
+        if self.config.channel_mode == ChannelMode.AXI:
+            self._all_wires = (
+                self._aw_wires +
+                self._w_wires +
+                self._ar_wires +
+                self._b_wires +
+                self._r_wires
+            )
+        else:
+            self._all_wires = self._req_wires + self._resp_wires
+
     def get_router(self, coord: Tuple[int, int]) -> Optional[Router]:
         """Get router at coordinate."""
         return self.routers.get(coord)
@@ -403,46 +428,14 @@ class Mesh:
         self.stats.total_cycles += 1
 
     def _propagate_all_wires(self) -> None:
-        """Propagate signals on all wires."""
-        if self.config.channel_mode == ChannelMode.AXI:
-            # AXI Mode: 5 channels
-            for wire in self._aw_wires:
-                wire.propagate_signals()
-            for wire in self._w_wires:
-                wire.propagate_signals()
-            for wire in self._ar_wires:
-                wire.propagate_signals()
-            for wire in self._b_wires:
-                wire.propagate_signals()
-            for wire in self._r_wires:
-                wire.propagate_signals()
-        else:
-            # General Mode: Req/Resp
-            for wire in self._req_wires:
-                wire.propagate_signals()
-            for wire in self._resp_wires:
-                wire.propagate_signals()
+        """Propagate signals on all wires using unified list."""
+        for wire in self._all_wires:
+            wire.propagate_signals()
 
     def _handle_credit_release(self) -> None:
-        """Handle credit release for all wires."""
-        if self.config.channel_mode == ChannelMode.AXI:
-            # AXI Mode: 5 channels
-            for wire in self._aw_wires:
-                wire.propagate_credit_release()
-            for wire in self._w_wires:
-                wire.propagate_credit_release()
-            for wire in self._ar_wires:
-                wire.propagate_credit_release()
-            for wire in self._b_wires:
-                wire.propagate_credit_release()
-            for wire in self._r_wires:
-                wire.propagate_credit_release()
-        else:
-            # General Mode: Req/Resp
-            for wire in self._req_wires:
-                wire.propagate_credit_release()
-            for wire in self._resp_wires:
-                wire.propagate_credit_release()
+        """Handle credit release for all wires using unified list."""
+        for wire in self._all_wires:
+            wire.propagate_credit_release()
 
     def _transfer_ni_flits(self, current_time: int) -> None:
         """Transfer flits between NIs and their local routers using signal interface."""
