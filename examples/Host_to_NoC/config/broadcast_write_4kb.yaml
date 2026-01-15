@@ -1,0 +1,10 @@
+# Host to NoC - 4KB Broadcast Write Test
+# Tests HoL blocking behavior with larger transfer
+
+transfers:
+  - src_addr: 0x0000
+    src_size: 4096            # 4KB data
+    dst_addr: 0x1000
+    target_nodes: "all"       # All 16 nodes = 64KB total
+    transfer_mode: "broadcast"
+    max_outstanding: 8

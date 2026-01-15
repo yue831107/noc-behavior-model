@@ -33,7 +33,7 @@ from .packet import (
     Packet, PacketType, PacketFactory,
     PacketAssembler, PacketDisassembler
 )
-from .router import RouterPort, Direction
+from .router import RouterPort, Direction, ChannelMode
 
 from ..axi.interface import (
     AXI_AW, AXI_W, AXI_B, AXI_AR, AXI_R,
@@ -78,6 +78,11 @@ class NIConfig:
     # If True, destination is from AXI user signal: awuser[7:0]=x, awuser[15:8]=y
     # If False (default), destination is from address encoding: addr[39:32]=node_id
     use_user_signal_routing: bool = False
+
+    # Physical channel mode
+    # GENERAL: Single req/resp buffer (AW/W/AR share, B/R share)
+    # AXI: Per-channel buffers (AW, W, AR, B, R independent)
+    channel_mode: ChannelMode = ChannelMode.GENERAL
 
 
 @dataclass
@@ -180,14 +185,31 @@ class _SlaveNI_ReqPath:
         # AW/AR Spill Reg + W Payload Store (spec.md)
         self._pending_writes: Dict[int, PendingTransaction] = {}
 
-        # Ready-to-send queue: writes with all W beats, waiting for buffer space
-        self._ready_to_send: Deque[PendingTransaction] = deque()
-
         # Output buffer for request flits
+        # General Mode: Single buffer for all channels
         self.output_buffer = FlitBuffer(
             self.config.req_buffer_depth,
             f"SlaveNI({coord})_req_out"
         )
+
+        # AXI Mode: Per-channel output buffers
+        # Each AXI channel (AW, W, AR) has independent buffer
+        self._per_channel_buffers: Dict[AxiChannel, FlitBuffer] = {}
+        if self.config.channel_mode == ChannelMode.AXI:
+            for ch in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
+                self._per_channel_buffers[ch] = FlitBuffer(
+                    self.config.req_buffer_depth,
+                    f"SlaveNI({coord})_{ch.name}_out"
+                )
+
+        # Pending W flits queue (for backpressure handling)
+        # Key: axi_id, Value: deque of W flits waiting to be sent
+        self._pending_w_flits: Dict[int, Deque[Flit]] = {}
+
+        # Cycle-accurate flit sending tracking for W flits
+        # W flits (data) are rate-limited to 1 per cycle
+        # AW/AR flits (address) are NOT rate-limited as they're small
+        self._last_w_flit_cycle: int = -1
 
         # B RoB / R RoB: Track outstanding transactions for response matching
         self._active_transactions: Dict[int, PendingTransaction] = {}
@@ -206,6 +228,24 @@ class _SlaveNI_ReqPath:
         """Connect output to router request port."""
         self.output_port = port
 
+    def _get_target_buffer(self, channel: AxiChannel) -> FlitBuffer:
+        """Get the appropriate output buffer for a channel."""
+        if self.config.channel_mode == ChannelMode.AXI:
+            return self._per_channel_buffers[channel]
+        return self.output_buffer
+
+    def _push_flit(self, flit: Flit) -> bool:
+        """Push flit to appropriate buffer based on channel mode."""
+        target = self._get_target_buffer(flit.hdr.axi_ch)
+        if target.free_space > 0:
+            target.push(flit)
+            return True
+        return False
+
+    def _has_buffer_space(self, channel: AxiChannel) -> bool:
+        """Check if buffer has space for the given channel."""
+        return self._get_target_buffer(channel).free_space > 0
+
     def _allocate_rob_idx(self) -> int:
         """Allocate a ROB index for tracking."""
         idx = self._next_rob_idx
@@ -215,6 +255,9 @@ class _SlaveNI_ReqPath:
     def process_aw(self, aw: AXI_AW, timestamp: int = 0) -> bool:
         """
         Process AXI Write Address channel.
+
+        Streaming behavior: AW flit is created and sent immediately.
+        Does not wait for W beats.
 
         Args:
             aw: Write address request.
@@ -226,9 +269,8 @@ class _SlaveNI_ReqPath:
         if len(self._active_transactions) >= self.config.max_outstanding:
             return False
 
-        # Also check if output buffer has space for at least one packet
-        # This provides backpressure when the NI is congested
-        if self.output_buffer.free_space < 1:
+        # Check if AW buffer has space (channel-aware)
+        if not self._has_buffer_space(AxiChannel.AW):
             return False
 
         self.stats.aw_received += 1
@@ -246,10 +288,27 @@ class _SlaveNI_ReqPath:
             # Host-to-NoC mode: destination from address encoding
             dest_coord, local_addr = self.addr_translator.translate(aw.awaddr)
 
-        # Create pending transaction (AW Spill Reg)
+        # Allocate ROB index now (shared with W flits)
+        rob_idx = self._allocate_rob_idx()
+
+        # Create and send AW flit immediately (streaming)
+        aw_flit = FlitFactory.create_aw(
+            src=self.coord,
+            dest=dest_coord,
+            addr=local_addr,
+            axi_id=aw.awid,
+            length=aw.burst_length - 1,  # awlen = beats - 1
+            rob_idx=rob_idx,
+            rob_req=True,
+            last=False,  # W flit(s) will follow
+        )
+        self._push_flit(aw_flit)
+        self.stats.req_flits_sent += 1
+
+        # Create pending transaction for tracking W beats
         txn = PendingTransaction(
             axi_id=aw.awid,
-            rob_idx=0,  # Will be set when packet is created
+            rob_idx=rob_idx,
             is_write=True,
             state=TransactionState.PENDING_W,
             timestamp_start=timestamp,
@@ -261,11 +320,21 @@ class _SlaveNI_ReqPath:
         )
 
         self._pending_writes[aw.awid] = txn
+        # Only create new queue if not exists or empty
+        # Avoid overwriting pending W flits from previous transaction with same ID
+        if aw.awid not in self._pending_w_flits or not self._pending_w_flits[aw.awid]:
+            self._pending_w_flits[aw.awid] = deque()
         return True
 
     def process_w(self, w: AXI_W, axi_id: int, timestamp: int = 0) -> bool:
         """
         Process AXI Write Data channel.
+
+        Streaming behavior: W flit is created immediately for each beat.
+        Flit sending is cycle-accurate (at most 1 W flit per cycle).
+
+        API accepts W beats even if flit cannot be sent this cycle - the flit
+        is queued and sent in subsequent cycles by _try_send_pending_w_flits().
 
         Args:
             w: Write data beat.
@@ -273,92 +342,94 @@ class _SlaveNI_ReqPath:
             timestamp: Current simulation time.
 
         Returns:
-            True if accepted.
+            True if accepted (beat queued or sent).
         """
         if axi_id not in self._pending_writes:
             return False
 
         txn = self._pending_writes[axi_id]
-        txn.w_beats.append(w)  # W Payload Store
+        txn.w_beats.append(w)  # W Payload Store (for data tracking)
         txn.w_beats_received += 1
         self.stats.w_received += 1
 
-        # Check if all W beats received
-        if w.wlast or txn.w_beats_received >= txn.w_beats_expected:
-            # Move from pending_writes to ready_to_send
-            del self._pending_writes[axi_id]
-            self._ready_to_send.append(txn)
-            # Try to create and queue packet (Pack AW + Pack W)
-            self._try_send_ready_packets(timestamp)
+        # Determine if this is the last W beat
+        is_last = w.wlast or txn.w_beats_received >= txn.w_beats_expected
 
-        return True
-
-    def _try_send_ready_packets(self, timestamp: int) -> None:
-        """
-        Try to packetize and send ready-to-send transactions.
-        
-        Limits to 1 flit per cycle for cycle-accurate timing.
-        """
-        if not self._ready_to_send:
-            return
-            
-        txn = self._ready_to_send[0]  # Peek at front
-        all_sent = self._create_write_packet(txn, timestamp)
-        if all_sent:
-            self._ready_to_send.popleft()  # All flits sent
-
-    def _create_write_packet(self, txn: PendingTransaction, timestamp: int) -> bool:
-        """
-        Create write request packet from completed W beats.
-
-        For Wormhole routing, flits are sent as buffer space becomes available.
-        Returns True when ALL flits have been queued.
-
-        Returns:
-            True if all flits queued, False if still have flits to send.
-        """
-        # Check if packet was already created (retry case)
-        if hasattr(txn, '_cached_flits') and txn._cached_flits:
-            flits = txn._cached_flits
+        # Calculate strb based on actual data length (like PacketAssembler does)
+        # This ensures valid_bytes are correctly marked even if w.wstrb is wrong
+        data = w.wdata
+        valid_bytes = len(data)
+        flit_payload_size = self.config.flit_payload_size
+        if valid_bytes >= flit_payload_size:
+            strb = (1 << flit_payload_size) - 1  # All bytes valid
         else:
-            # Concatenate all write data
-            data = b"".join(w.wdata for w in txn.w_beats)
+            strb = (1 << valid_bytes) - 1  # Only first valid_bytes are valid
 
-            # Create packet
-            packet = PacketFactory.create_write_request(
-                src=txn.src_coord,
-                dest=txn.dest_coord,
-                local_addr=txn.local_addr,
-                data=data,
-                axi_id=txn.axi_id,
-            )
+        # Create W flit immediately (streaming)
+        w_flit = FlitFactory.create_w(
+            src=txn.src_coord,
+            dest=txn.dest_coord,
+            data=data,
+            strb=strb,
+            last=is_last,
+            rob_idx=txn.rob_idx,
+            seq_num=txn.w_beats_received - 1,
+        )
 
-            txn.rob_idx = packet.rob_idx
+        # Cycle-accurate: Try to send immediately only if no W flit sent this cycle
+        # and buffer has space. Otherwise queue for later.
+        can_send_this_cycle = (self._last_w_flit_cycle != timestamp)
+        if can_send_this_cycle and self._has_buffer_space(AxiChannel.W):
+            self._push_flit(w_flit)
+            self._last_w_flit_cycle = timestamp  # Track for cycle-accurate limiting
+            self.stats.req_flits_sent += 1
+        else:
+            # Queue for later (backpressure or cycle-accurate limiting)
+            self._pending_w_flits[axi_id].append(w_flit)
 
-            # Assemble into flits
-            flits = self.packet_assembler.assemble(packet)
-
-            # Cache flits for streaming send
-            txn._cached_flits = list(flits)  # Make a mutable copy
-
-            # Track transaction as active when first flit is ready
+        # On wlast: complete transaction tracking
+        if is_last:
             self._active_transactions[txn.rob_idx] = txn
             self._rob_to_axi[txn.rob_idx] = txn.axi_id
             self.stats.write_requests += 1
+            del self._pending_writes[axi_id]
+            # Note: _pending_w_flits[axi_id] cleanup happens in _try_send_pending_w_flits
 
-        # Wormhole: send only 1 flit per cycle for cycle-accurate timing
-        if txn._cached_flits and self.output_buffer.free_space > 0:
-            flit = txn._cached_flits.pop(0)
-            self.output_buffer.push(flit)
+        return True
 
-        # Check if all flits sent
-        if not txn._cached_flits:
-            txn.state = TransactionState.PENDING_SEND
-            txn._cached_flits = None
-            return True
+    def _try_send_pending_w_flits(self, timestamp: int = 0) -> None:
+        """
+        Try to send pending W flits from backpressure queue.
 
-        # Still have flits to send
-        return False
+        Sends at most 1 flit per cycle for cycle-accurate timing.
+        Skips if a W flit was already sent this cycle.
+
+        Args:
+            timestamp: Current simulation cycle.
+        """
+        # Cycle-accurate: Skip if W flit already sent this cycle
+        if self._last_w_flit_cycle == timestamp:
+            return
+
+        if not self._has_buffer_space(AxiChannel.W):
+            return
+
+        # Try each transaction with pending W flits
+        for axi_id in list(self._pending_w_flits.keys()):
+            w_queue = self._pending_w_flits[axi_id]
+            if w_queue:
+                flit = w_queue.popleft()
+                self._push_flit(flit)
+                self._last_w_flit_cycle = timestamp  # Track for cycle-accurate
+                self.stats.req_flits_sent += 1
+                break  # Only 1 flit per cycle
+
+        # Cleanup empty queues for completed transactions
+        for axi_id in list(self._pending_w_flits.keys()):
+            if not self._pending_w_flits[axi_id]:
+                # Check if transaction is complete (all W beats received)
+                if axi_id not in self._pending_writes:
+                    del self._pending_w_flits[axi_id]
 
     def process_ar(self, ar: AXI_AR, timestamp: int = 0) -> bool:
         """
@@ -374,9 +445,8 @@ class _SlaveNI_ReqPath:
         if len(self._active_transactions) >= self.config.max_outstanding:
             return False
 
-        # Also check if output buffer has space for at least one packet
-        # This provides backpressure when the NI is congested
-        if self.output_buffer.free_space < 1:
+        # Check if AR buffer has space (channel-aware)
+        if not self._has_buffer_space(AxiChannel.AR):
             return False
 
         self.stats.ar_received += 1
@@ -423,9 +493,9 @@ class _SlaveNI_ReqPath:
         # Assemble into flits (Pack AR)
         flits = self.packet_assembler.assemble(packet)
 
-        # Queue flits
+        # Queue flits (using per-channel buffer in AXI Mode)
         for flit in flits:
-            self.output_buffer.push(flit)
+            self._push_flit(flit)
 
         self._active_transactions[packet.rob_idx] = txn
         self._rob_to_axi[packet.rob_idx] = ar.arid
@@ -433,18 +503,71 @@ class _SlaveNI_ReqPath:
         self.stats.read_requests += 1
         return True
 
-    def get_output_flit(self) -> Optional[Flit]:
-        """Get next flit to send to NoC."""
-        flit = self.output_buffer.pop()
+    def get_output_flit(self, current_cycle: int = 0) -> Optional[Flit]:
+        """
+        Get next flit to send to NoC.
+
+        Args:
+            current_cycle: Current simulation cycle (for injection tracking).
+
+        Returns:
+            Flit if available, None otherwise.
+        """
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: check per-channel buffers in order (AW, W, AR)
+            for channel in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
+                buffer = self._per_channel_buffers[channel]
+                if not buffer.is_empty():
+                    flit = buffer.pop()
+                    if flit is not None:
+                        self._finalize_flit_send(flit, current_cycle)
+                        return flit
+            return None
+        else:
+            # General Mode: use single buffer
+            flit = self.output_buffer.pop()
+            if flit is not None:
+                self._finalize_flit_send(flit, current_cycle)
+            return flit
+
+    def get_channel_flit(
+        self,
+        channel: AxiChannel,
+        current_cycle: int = 0
+    ) -> Optional[Flit]:
+        """
+        Get next flit for a specific AXI channel (AXI Mode).
+
+        Args:
+            channel: AXI channel to get flit from.
+            current_cycle: Current simulation cycle.
+
+        Returns:
+            Flit if available, None otherwise.
+        """
+        if self.config.channel_mode != ChannelMode.AXI:
+            # In General Mode, fall back to single buffer
+            return self.get_output_flit(current_cycle)
+
+        if channel not in self._per_channel_buffers:
+            return None
+
+        flit = self._per_channel_buffers[channel].pop()
         if flit is not None:
-            self.stats.req_flits_sent += 1
-
-            # Update transaction state
-            if flit.hdr.rob_idx in self._active_transactions:
-                txn = self._active_transactions[flit.hdr.rob_idx]
-                txn.state = TransactionState.IN_FLIGHT
-
+            self._finalize_flit_send(flit, current_cycle)
         return flit
+
+    def _finalize_flit_send(self, flit: Flit, current_cycle: int) -> None:
+        """Common finalization after sending a flit."""
+        self.stats.req_flits_sent += 1
+
+        # Update transaction state
+        if flit.hdr.rob_idx in self._active_transactions:
+            txn = self._active_transactions[flit.hdr.rob_idx]
+            txn.state = TransactionState.IN_FLIGHT
+
+        # BookSim2-style: Store injection cycle on flit for latency calculation
+        flit.injection_cycle = current_cycle
 
     def mark_transaction_complete(self, rob_idx: int, timestamp: int) -> Optional[int]:
         """Mark a transaction as complete (response received)."""
@@ -483,19 +606,34 @@ class _SlaveNI_ReqPath:
         return True
 
     def has_pending_output(self) -> bool:
-        """Check if there are flits waiting to be sent."""
-        return not self.output_buffer.is_empty()
+        """Check if there are flits ready to be sent from output buffers.
+
+        Note: This only checks output buffers, NOT _pending_w_flits.
+        _pending_w_flits contains flits waiting for cycle-accurate rate limiting
+        or backpressure handling. They are moved to output buffers by
+        _try_send_pending_w_flits() during process_cycle().
+        """
+        # Check per-channel buffers if in AXI mode
+        if self.config.channel_mode == ChannelMode.AXI:
+            for ch in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
+                if not self._per_channel_buffers[ch].is_empty():
+                    return True
+        else:
+            if not self.output_buffer.is_empty():
+                return True
+
+        return False
 
     def process_cycle(self, timestamp: int = 0) -> None:
-        """Process one cycle - try to send any ready packets."""
-        self._try_send_ready_packets(timestamp)
+        """Process one cycle - try to send any pending flits."""
+        # Try to send pending W flits from backpressure queue
+        # Pass timestamp for cycle-accurate limiting
+        self._try_send_pending_w_flits(timestamp)
 
     @property
     def outstanding_count(self) -> int:
         """Number of outstanding transactions."""
-        return (len(self._active_transactions) +
-                len(self._pending_writes) +
-                len(self._ready_to_send))
+        return len(self._active_transactions) + len(self._pending_writes)
 
 
 class _SlaveNI_RspPath:
@@ -747,9 +885,34 @@ class SlaveNI:
         return self.req_path.process_ar(ar, timestamp)
 
     # === NoC Interface ===
-    def get_req_flit(self) -> Optional[Flit]:
-        """Get request flit to send to NoC (Request Router)."""
-        return self.req_path.get_output_flit()
+    def get_req_flit(self, current_cycle: int = 0) -> Optional[Flit]:
+        """
+        Get request flit to send to NoC (Request Router).
+
+        Args:
+            current_cycle: Current simulation cycle (for injection tracking).
+
+        Returns:
+            Flit if available, None otherwise.
+        """
+        return self.req_path.get_output_flit(current_cycle)
+
+    def get_channel_flit(
+        self,
+        channel: AxiChannel,
+        current_cycle: int = 0
+    ) -> Optional[Flit]:
+        """
+        Get request flit for specific AXI channel (AXI Mode).
+
+        Args:
+            channel: AXI channel (AW, W, or AR).
+            current_cycle: Current simulation cycle.
+
+        Returns:
+            Flit if available, None otherwise.
+        """
+        return self.req_path.get_channel_flit(channel, current_cycle)
 
     def receive_resp_flit(self, flit: Flit) -> bool:
         """Receive response flit from NoC (Response Router)."""
@@ -793,26 +956,26 @@ class SlaveNI:
     @property
     def aw_ready(self) -> bool:
         """Check if AW channel can accept new request."""
-        # Check outstanding limit and output buffer space
-        return (
-            len(self.req_path._active_transactions) < self.config.max_outstanding
-            and self.req_path.output_buffer.free_space >= 1
-        )
+        if len(self.req_path._active_transactions) >= self.config.max_outstanding:
+            return False
+        # Check channel-specific buffer space
+        return self.req_path._has_buffer_space(AxiChannel.AW)
 
     @property
     def w_ready(self) -> bool:
         """Check if W channel can accept data beat."""
-        # W is ready if there's a pending write transaction
-        return len(self.req_path._pending_writes) > 0
+        # W is ready if there's a pending write transaction AND buffer has space
+        has_pending = len(self.req_path._pending_writes) > 0
+        has_space = self.req_path._has_buffer_space(AxiChannel.W)
+        return has_pending and has_space
 
     @property
     def ar_ready(self) -> bool:
         """Check if AR channel can accept new request."""
-        # Same checks as AW
-        return (
-            len(self.req_path._active_transactions) < self.config.max_outstanding
-            and self.req_path.output_buffer.free_space >= 1
-        )
+        if len(self.req_path._active_transactions) >= self.config.max_outstanding:
+            return False
+        # Check channel-specific buffer space
+        return self.req_path._has_buffer_space(AxiChannel.AR)
 
     @property
     def has_b_response(self) -> bool:
@@ -1232,10 +1395,20 @@ class MasterNI:
         )
 
         # Output buffer for response flits (to Response Router)
+        # General Mode: Single buffer for all response channels
         self.resp_output = FlitBuffer(
             self.config.resp_buffer_depth,
             f"MasterNI({coord})_rsp_out"
         )
+
+        # AXI Mode: Per-channel output buffers for B and R
+        self._resp_per_channel: Dict[AxiChannel, FlitBuffer] = {}
+        if self.config.channel_mode == ChannelMode.AXI:
+            for ch in [AxiChannel.B, AxiChannel.R]:
+                self._resp_per_channel[ch] = FlitBuffer(
+                    self.config.resp_buffer_depth,
+                    f"MasterNI({coord})_{ch.name}_out"
+                )
 
         # === Per-ID FIFO (spec.md key component) ===
         # Store incoming request info by AXI ID for response routing
@@ -1264,16 +1437,17 @@ class MasterNI:
         # Statistics
         self.stats = NIStats()
 
-        # R beat accumulation buffer for multi-beat reads
-        # Keyed by AXI ID -> accumulated bytes
-        self._pending_r_data: Dict[int, bytes] = {}
-        
-        # Queue for flits waiting to be sent (Wormhole: one flit per cycle)
-        self._pending_flits: Deque[Flit] = deque()
+        # R beat sequence number tracking for streaming R flits
+        # Keyed by AXI ID -> current seq_num
+        self._r_seq_num: Dict[int, int] = {}
 
-        # Packet arrival callback for metrics collection
-        # Called with (packet_id, creation_time, arrival_time) when a packet arrives
-        self._packet_arrival_callback: Optional[Callable[[int, int, int], None]] = None
+        # Pending R flits queue for backpressure handling
+        self._pending_r_flits: Deque[Flit] = deque()
+
+        # Flit latency callback for metrics collection (BookSim2-style)
+        # Called with (latency,) when each flit arrives at destination
+        # This enables per-flit latency tracking, matching BookSim2 behavior
+        self._flit_latency_callback: Optional[Callable[[int], None]] = None
 
         # === Valid/Ready Interface Signals ===
         # Request input (Router LOCAL → NI)
@@ -1285,6 +1459,23 @@ class MasterNI:
         self.resp_out_valid: bool = False
         self.resp_out_flit: Optional[Flit] = None
         self.resp_out_ready: bool = False  # Set by downstream (router)
+
+    # === Per-Channel Buffer Helpers ===
+
+    def _get_resp_buffer(self, channel: AxiChannel) -> FlitBuffer:
+        """Get the appropriate response output buffer for a channel."""
+        if self.config.channel_mode == ChannelMode.AXI:
+            return self._resp_per_channel.get(channel, self.resp_output)
+        return self.resp_output
+
+    def _push_resp_flit(self, flit: Flit) -> bool:
+        """Push response flit to appropriate buffer based on channel mode."""
+        target = self._get_resp_buffer(flit.hdr.axi_ch)
+        return target.push(flit)
+
+    def _has_resp_buffer_space(self, channel: AxiChannel) -> bool:
+        """Check if response buffer has space for the given channel."""
+        return self._get_resp_buffer(channel).free_space > 0
 
     # === Valid/Ready Interface Methods ===
 
@@ -1343,14 +1534,18 @@ class MasterNI:
 
     # === Packet Arrival Callback ===
 
-    def set_packet_arrival_callback(self, callback: Callable[[int, int, int], None]) -> None:
+    def set_flit_latency_callback(self, callback: Callable[[int], None]) -> None:
         """
-        Set callback for packet arrival notification.
+        Set callback for per-flit latency notification.
+
+        This callback is invoked when each flit arrives at the MasterNI.
+        The latency is calculated as: arrival_cycle - injection_cycle.
+        Used for BookSim2-style per-flit latency tracking.
 
         Args:
-            callback: Function that receives (packet_id, creation_time, arrival_time).
+            callback: Function that receives (latency_in_cycles,).
         """
-        self._packet_arrival_callback = callback
+        self._flit_latency_callback = callback
 
     # === NoC Interface (Legacy) ===
 
@@ -1376,7 +1571,69 @@ class MasterNI:
         Returns:
             Response flit if available.
         """
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: check B then R channel buffers
+            for channel in [AxiChannel.B, AxiChannel.R]:
+                if channel in self._resp_per_channel:
+                    flit = self._resp_per_channel[channel].pop()
+                    if flit is not None:
+                        return flit
+            return None
         return self.resp_output.pop()
+
+    def get_channel_resp_flit(self, channel: AxiChannel) -> Optional[Flit]:
+        """
+        Get next response flit for specific AXI channel (AXI Mode).
+
+        Args:
+            channel: AXI channel (B or R).
+
+        Returns:
+            Response flit if available, None otherwise.
+        """
+        if self.config.channel_mode != ChannelMode.AXI:
+            return self.get_resp_flit()
+
+        if channel not in self._resp_per_channel:
+            return None
+
+        return self._resp_per_channel[channel].pop()
+
+    def peek_channel_resp_flit(self, channel: AxiChannel) -> Optional[Flit]:
+        """
+        Peek at next response flit for specific channel without removing.
+
+        Args:
+            channel: AXI channel (B or R).
+
+        Returns:
+            Response flit if available, None otherwise.
+        """
+        if self.config.channel_mode != ChannelMode.AXI:
+            return self.resp_output.peek()
+
+        if channel not in self._resp_per_channel:
+            return None
+
+        return self._resp_per_channel[channel].peek()
+
+    def has_pending_channel_response(self, channel: AxiChannel) -> bool:
+        """
+        Check if responses are pending for specific channel.
+
+        Args:
+            channel: AXI channel (B or R).
+
+        Returns:
+            True if pending responses exist.
+        """
+        if self.config.channel_mode != ChannelMode.AXI:
+            return not self.resp_output.is_empty()
+
+        if channel not in self._resp_per_channel:
+            return False
+
+        return not self._resp_per_channel[channel].is_empty()
 
     # === Processing ===
 
@@ -1408,6 +1665,14 @@ class MasterNI:
             if flit is None:
                 break
 
+            # BookSim2-style: Calculate per-flit latency
+            # Flit carries its injection_cycle (set by SlaveNI)
+            if self._flit_latency_callback is not None:
+                injection_cycle = getattr(flit, 'injection_cycle', None)
+                if injection_cycle is not None:
+                    latency = current_time - injection_cycle
+                    self._flit_latency_callback(latency)
+
             # Try to reconstruct packet
             packet = self.packet_disassembler.receive_flit(flit)
             if packet is not None:
@@ -1420,9 +1685,7 @@ class MasterNI:
         Converts packet to AXI request, stores info in Per-ID FIFO,
         and forwards to Memory.
         """
-        # Notify packet arrival for metrics collection
-        if self._packet_arrival_callback:
-            self._packet_arrival_callback(packet.rob_idx, 0, current_time)
+        # Note: Per-flit latency tracking is done in _process_incoming_flits()
 
         # Store request info in Per-ID FIFO for response routing
         req_info = MasterNI_RequestInfo(
@@ -1496,139 +1759,128 @@ class MasterNI:
         Uses Per-ID FIFO to match responses with original requests
         and extract routing info (Routing Logic).
 
-        IMPORTANT: Check resp_output buffer space before collecting to
-        prevent packet drops due to backpressure.
+        IMPORTANT: Cycle-accurate behavior:
+        - AXI Mode: Each channel (B, R) can send at most 1 flit per cycle
+        - General Mode: All channels share output, at most 1 flit per cycle total
+
+        This ensures flit injection rate matches physical constraints.
         """
-        # Collect B responses (write complete)
-        while self.axi_slave.has_pending_b():
-            # Check if we have space for at least 1 response flit
-            if self.resp_output.free_space < 1:
-                break  # Backpressure - wait for next cycle
+        # Track flits sent this cycle for cycle-accurate limiting
+        b_flit_sent = False
+        r_flit_sent = False
 
-            b_resp = self.axi_slave.get_b_response()
-            if b_resp is None:
-                break
+        # In General Mode, all responses share one output - only one flit total
+        general_mode = (self.config.channel_mode != ChannelMode.AXI)
 
-            # Match with Per-ID FIFO (Routing Logic)
-            axi_id = b_resp.bid
-            if axi_id in self._per_id_fifo and self._per_id_fifo[axi_id]:
-                req_info = self._per_id_fifo[axi_id].popleft()
+        # Collect B response (write complete) - at most 1 per cycle
+        if self.axi_slave.has_pending_b():
+            b_buffer = self._get_resp_buffer(AxiChannel.B)
+            if b_buffer.free_space >= 1:
+                b_resp = self.axi_slave.get_b_response()
+                if b_resp is not None:
+                    axi_id = b_resp.bid
+                    if axi_id in self._per_id_fifo and self._per_id_fifo[axi_id]:
+                        req_info = self._per_id_fifo[axi_id].popleft()
 
-                # Create response packet with routing info
-                resp_packet = PacketFactory.create_write_response_from_info(
-                    src=self.coord,
-                    dest=req_info.src_coord,  # Route back to source
-                    axi_id=axi_id,
-                )
+                        # Create response packet with routing info
+                        resp_packet = PacketFactory.create_write_response_from_info(
+                            src=self.coord,
+                            dest=req_info.src_coord,
+                            axi_id=axi_id,
+                        )
 
-                # Pack into flits
-                flits = self.packet_assembler.assemble(resp_packet)
-                for flit in flits:
-                    if not self.resp_output.push(flit):
-                        # Should not happen if we checked space, but log it
-                        self.stats.resp_flits_dropped = getattr(
-                            self.stats, 'resp_flits_dropped', 0
-                        ) + 1
+                        # Pack into flits (B is single flit)
+                        flits = self.packet_assembler.assemble(resp_packet)
+                        for flit in flits:
+                            if not self._push_resp_flit(flit):
+                                self.stats.resp_flits_dropped = getattr(
+                                    self.stats, 'resp_flits_dropped', 0
+                                ) + 1
 
-                self.stats.b_responses_sent += 1
+                        self.stats.b_responses_sent += 1
+                        b_flit_sent = True
 
-        # Collect R responses (read data)
-        # Wormhole: First try to send pending flits (one per cycle)
-        self._try_send_pending_flits()
-        
-        # Only collect new R beats if no packet is currently being transmitted
-        # This ensures one packet at a time, preventing flit interleaving
-        if self._pending_flits:
-            return  # Wait until current packet is fully sent
-        
-        # Collect R beats from AXI slave
-        while self.axi_slave.has_pending_r():
-            r_resp = self.axi_slave.get_r_response()
-            if r_resp is None:
-                break
+        # In General Mode, skip R if we already sent a B flit
+        if general_mode and b_flit_sent:
+            return
 
-            # Accumulate R beat data by AXI ID
-            axi_id = r_resp.rid
-            if axi_id not in self._pending_r_data:
-                self._pending_r_data[axi_id] = b""
-            self._pending_r_data[axi_id] = self._pending_r_data[axi_id] + r_resp.rdata
+        # Collect R response (read data) - at most 1 per cycle
+        # First try to send pending R flits from backpressure queue
+        if not r_flit_sent:
+            r_flit_sent = self._try_send_one_pending_r_flit()
 
-            # Only create response packet on rlast (complete read)
-            if not r_resp.rlast:
-                continue
+        # If no pending flit was sent, try to collect new R beat
+        if not r_flit_sent and self.axi_slave.has_pending_r():
+            r_buffer = self._get_resp_buffer(AxiChannel.R)
+            if r_buffer.free_space >= 1:
+                r_resp = self.axi_slave.get_r_response()
+                if r_resp is not None:
+                    axi_id = r_resp.rid
 
-            # Get accumulated data for this transaction
-            accumulated_data = self._pending_r_data.pop(axi_id, r_resp.rdata)
+                    # Get routing info from Per-ID FIFO (peek, don't pop yet)
+                    if axi_id in self._per_id_fifo and self._per_id_fifo[axi_id]:
+                        req_info = self._per_id_fifo[axi_id][0]  # Peek
 
-            # Match with Per-ID FIFO (Routing Logic)
-            if axi_id in self._per_id_fifo and self._per_id_fifo[axi_id]:
-                req_info = self._per_id_fifo[axi_id].popleft()
-                
-                # Create response packet and queue flits (Wormhole flow)
-                resp_packet = PacketFactory.create_read_response_from_info(
-                    src=self.coord,
-                    dest=req_info.src_coord,
-                    axi_id=axi_id,
-                    data=accumulated_data,
-                )
+                        # Get/initialize sequence number for this transaction
+                        if axi_id not in self._r_seq_num:
+                            self._r_seq_num[axi_id] = 0
+                        seq_num = self._r_seq_num[axi_id]
+                        self._r_seq_num[axi_id] = seq_num + 1
 
-                # Assemble into flits and queue for sending
-                flits = self.packet_assembler.assemble(resp_packet)
-                for flit in flits:
-                    self._pending_flits.append(flit)
-                
-                self.stats.r_responses_sent += 1
-                
-                # Only queue one response packet per cycle (wormhole serialization)
-                break
+                        # Create R flit immediately for this beat (streaming)
+                        r_flit = FlitFactory.create_r(
+                            src=self.coord,
+                            dest=req_info.src_coord,
+                            data=r_resp.rdata,
+                            axi_id=axi_id,
+                            resp=r_resp.rresp,
+                            last=r_resp.rlast,
+                            rob_idx=req_info.rob_idx,
+                            seq_num=seq_num,
+                        )
 
-    def _try_send_pending_flits(self) -> None:
+                        # Try to send immediately, queue if buffer full
+                        if self._has_resp_buffer_space(AxiChannel.R):
+                            self._push_resp_flit(r_flit)
+                            r_flit_sent = True
+                        else:
+                            self._pending_r_flits.append(r_flit)
+
+                        # On rlast: complete transaction
+                        if r_resp.rlast:
+                            self._per_id_fifo[axi_id].popleft()
+                            del self._r_seq_num[axi_id]
+                            self.stats.r_responses_sent += 1
+
+    def _try_send_one_pending_r_flit(self) -> bool:
         """
-        Wormhole flow control: send ONE flit per cycle.
-        
-        This is the correct wormhole behavior. The serialization of packets
-        should be handled by not collecting new AXI responses while a packet
-        is still being transmitted (has flits in _pending_flits).
+        Try to send one pending R flit from backpressure queue.
+
+        Returns:
+            True if a flit was sent, False otherwise.
         """
-        # Send one flit per cycle (wormhole behavior)
-        if self._pending_flits and self.resp_output.free_space >= 1:
-            flit = self._pending_flits.popleft()
-            if not self.resp_output.push(flit):
-                # Put back if failed
-                self._pending_flits.appendleft(flit)
-                self.stats.resp_flits_dropped = getattr(
-                    self.stats, 'resp_flits_dropped', 0
-                ) + 1
+        if not self._pending_r_flits:
+            return False
+
+        if not self._has_resp_buffer_space(AxiChannel.R):
+            return False
+
+        flit = self._pending_r_flits.popleft()
+        if self._push_resp_flit(flit):
+            return True
+        else:
+            # Put back if failed
+            self._pending_r_flits.appendleft(flit)
+            return False
 
     def _process_deferred_responses(self, current_time: int) -> None:
         """
-        Process responses that were deferred (put-back) from previous cycles.
-        
-        This handles the case where accumulated R data exists in _pending_r_data
-        with a matching entry in _per_id_fifo, but was deferred because
-        _pending_flits was not empty at the time.
-        """
-        # Find a deferred response to process
-        for axi_id in list(self._pending_r_data.keys()):
-            if axi_id in self._per_id_fifo and self._per_id_fifo[axi_id]:
-                # Found deferred response - process it
-                accumulated_data = self._pending_r_data.pop(axi_id)
-                req_info = self._per_id_fifo[axi_id].popleft()
-                
-                # Create response packet and queue flits
-                resp_packet = PacketFactory.create_read_response_from_info(
-                    src=self.coord,
-                    dest=req_info.src_coord,
-                    axi_id=axi_id,
-                    data=accumulated_data,
-                )
+        Legacy method - no longer needed with streaming R flit mode.
 
-                flits = self.packet_assembler.assemble(resp_packet)
-                for flit in flits:
-                    self._pending_flits.append(flit)
-                
-                self.stats.r_responses_sent += 1
-                break  # Only process one per cycle
+        R flits are now sent immediately as each beat arrives,
+        queued in _pending_r_flits if backpressure occurs.
+        """
+        pass  # No-op: streaming mode handles R flits differently
 
     # === Direct Memory Access (for initialization/debug) ===
 
@@ -1646,7 +1898,33 @@ class MasterNI:
 
     def has_pending_response(self) -> bool:
         """Check if responses are pending."""
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: check both B and R channel buffers
+            for channel in [AxiChannel.B, AxiChannel.R]:
+                if channel in self._resp_per_channel:
+                    if not self._resp_per_channel[channel].is_empty():
+                        return True
+            return False
         return not self.resp_output.is_empty()
+
+    def peek_resp_flit(self) -> Optional[Flit]:
+        """
+        Peek at next response flit without removing it.
+
+        Used by AXI Mode to determine which channel router to use.
+
+        Returns:
+            Next response flit if available, None otherwise.
+        """
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: check B then R channel buffers
+            for channel in [AxiChannel.B, AxiChannel.R]:
+                if channel in self._resp_per_channel:
+                    flit = self._resp_per_channel[channel].peek()
+                    if flit is not None:
+                        return flit
+            return None
+        return self.resp_output.peek()
 
     def __repr__(self) -> str:
         return (

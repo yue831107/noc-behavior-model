@@ -8,8 +8,9 @@
 2. [Bit-Level 詳細比較](#bit-level-詳細比較)
 3. [優缺點分析](#優缺點分析)
 4. [效能影響分析](#效能影響分析)
-5. [Trade-off 決策指南](#trade-off-決策指南)
-6. [建議與結論](#建議與結論)
+5. [模擬驗證結果](#模擬驗證結果)
+6. [Trade-off 決策指南](#trade-off-決策指南)
+7. [建議與結論](#建議與結論)
 
 ---
 
@@ -288,6 +289,8 @@ Sub-Router 數量: 5 個
 | **Wire 數量/方向** | 4 條 | 10 條 | +150% |
 | **Sub-Router 數量** | 2 個 (Req+Resp) | 5 個 (AW+W+AR+B+R) | +150% |
 | **Arbiter 數量** | 10 個 | 25 個 | +150% |
+| **NI→Router Channel** | 2 條 (Req+Resp) | 5 條 (AW+W+AR+B+R) | +150% |
+| **NI Output Buffer** | 2 個 (共用) | 5 個 (獨立) | +150% |
 
 ### Payload 利用率分析
 
@@ -314,6 +317,79 @@ Sub-Router 數量: 5 個
 | R | 266 bits | 266 bits | 0 bits | 0% |
 
 **平均浪費率**: 0%
+
+### Channel 利用率分析
+
+除了 Payload 利用率外，不同工作負載下的 Channel 利用率也是重要的考量因素。
+
+#### Write-Heavy Workload（例如：DMA 寫入）
+
+| Channel | 方案 A | 方案 B | 說明 |
+|---------|--------|--------|------|
+| AW | Request Channel 共用 | 高利用率 | 每個 write transaction 需要一個 AW flit |
+| W | Request Channel 共用 | 極高利用率 | burst write 產生大量 W flits |
+| AR | Request Channel 共用 | **閒置** | 無 read 操作 |
+| B | Response Channel 共用 | 高利用率 | 每個 write 需要 response |
+| R | Response Channel 共用 | **閒置** | 無 read 操作 |
+
+```
+方案 A (General Mode) - Write-Heavy:
+  Request Channel:  AW → W → W → W → W → AW → W → W → ...  (高利用率)
+  Response Channel: B → B → B → ...                         (中利用率)
+
+方案 B (AXI Mode) - Write-Heavy:
+  AW: ████████████░░░░  (高利用率)
+  W:  ████████████████  (極高利用率)
+  AR: ░░░░░░░░░░░░░░░░  (閒置)
+  B:  ████████████░░░░  (高利用率)
+  R:  ░░░░░░░░░░░░░░░░  (閒置)
+```
+
+#### Read-Heavy Workload（例如：DMA 讀取）
+
+| Channel | 方案 A | 方案 B | 說明 |
+|---------|--------|--------|------|
+| AW | Request Channel 共用 | **閒置** | 無 write 操作 |
+| W | Request Channel 共用 | **閒置** | 無 write 操作 |
+| AR | Request Channel 共用 | 高利用率 | 每個 read transaction 需要一個 AR flit |
+| B | Response Channel 共用 | **閒置** | 無 write 操作 |
+| R | Response Channel 共用 | 極高利用率 | burst read 產生大量 R flits |
+
+```
+方案 A (General Mode) - Read-Heavy:
+  Request Channel:  AR → AR → AR → ...                      (低利用率)
+  Response Channel: R → R → R → R → R → R → R → ...         (高利用率)
+
+方案 B (AXI Mode) - Read-Heavy:
+  AW: ░░░░░░░░░░░░░░░░  (閒置)
+  W:  ░░░░░░░░░░░░░░░░  (閒置)
+  AR: ████████████░░░░  (高利用率)
+  B:  ░░░░░░░░░░░░░░░░  (閒置)
+  R:  ████████████████  (極高利用率)
+```
+
+#### Mixed Workload（50/50 讀寫混合）
+
+| Channel | 方案 A | 方案 B |
+|---------|--------|--------|
+| AW | Request Channel 共用 | 中利用率 |
+| W | Request Channel 共用 | 高利用率 |
+| AR | Request Channel 共用 | 中利用率 |
+| B | Response Channel 共用 | 中利用率 |
+| R | Response Channel 共用 | 高利用率 |
+
+#### Channel 利用率 Trade-off 分析
+
+| 工作負載 | 方案 A 特性 | 方案 B 特性 |
+|----------|-------------|-------------|
+| **Write-Heavy** | Request Channel 高利用率，Response 低利用率 | AR/R Channel 完全閒置（50% 資源浪費） |
+| **Read-Heavy** | Request Channel 低利用率，Response 高利用率 | AW/W/B Channel 完全閒置（60% 資源浪費） |
+| **Mixed** | 兩個 Channel 都有中高利用率 | 所有 Channel 都有適度利用率 |
+
+**結論**：
+- **方案 A** 的共用 Channel 設計在單向工作負載下可更有效利用線寬資源
+- **方案 B** 在單向工作負載下會有部分 Channel 閒置，但在 Mixed 工作負載下不會有 HoL blocking
+- 選擇時需考慮實際應用的流量模式特性
 
 ---
 
@@ -429,6 +505,257 @@ AR Channel: ┌────┬────┬────┐
 
 ---
 
+## 模擬驗證結果
+
+本節展示使用 NoC Behavior Model 進行的實際模擬比較結果。
+
+### 測試配置
+
+| 參數 | 值 | 說明 |
+|------|-----|------|
+| Mesh Topology | 5×4 (20 routers) | 4 Edge Routers + 16 Compute Nodes |
+| Transfer Size | 4 KB | 每個目標節點 4KB |
+| Target Nodes | 16 (all) | Broadcast 到所有計算節點 |
+| Total Data | 64 KB | 4KB × 16 nodes |
+| Beat Size | 8 bytes | AXI data width = 64 bits |
+| Max Burst Length | 16 | 每個 AXI transaction |
+| Max Outstanding | 8 | 並行 transaction 數量 |
+| Buffer Depth | 16 | Router buffer 深度 |
+
+**Flit 數量計算**：
+- W flits = 64KB ÷ 8 bytes = **8,192 flits**
+- AW flits = 4KB ÷ (16 × 8 bytes) × 16 nodes = **512 flits**
+- Total request flits = **8,704 flits**
+
+### 效能比較結果
+
+| 指標 | General Mode | AXI Mode | 差異 |
+|------|-------------|----------|------|
+| **Total Cycles** | 8,267 | 8,203 | -0.8% |
+| **Throughput** | 1.05 flits/cycle | 1.06 flits/cycle | +1.0% |
+| **Average Latency** | 36.2 cycles | 4.5 cycles | -87.6% |
+| **Min Latency** | 3 cycles | 3 cycles | 0% |
+| **Max Latency** | 114 cycles | 6 cycles | -94.7% |
+| **Latency Variance** | 111 cycles | 3 cycles | **-97.3%** |
+| **L/L0 (Normalized)** | 8.04 | 1.00 | -87.6% |
+| **Saturation Status** | SATURATED | NORMAL | - |
+| **Verification** | 16 PASS | 16 PASS | - |
+
+### Latency 指標說明
+
+#### 什麼是 Per-Flit Latency？
+
+```
+Per-Flit Latency = MasterNI 收到時間 - SlaveNI 發出時間
+                 = arrival_cycle - injection_cycle
+```
+
+這是每個 flit 從進入網路到抵達目的地的時間。
+
+#### 什麼是 Latency Variance？
+
+```
+Latency Variance = Max Latency - Min Latency
+                 = 最慢 flit 的延遲 - 最快 flit 的延遲
+```
+
+**Latency Variance 代表網路延遲的可預測性**：
+- 低 variance = 延遲穩定、可預測（對 QoS 重要）
+- 高 variance = 延遲不穩定、難以預測
+
+### Dataflow 比較圖
+
+#### General Mode - HoL Blocking 發生點
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       GENERAL MODE DATAFLOW                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Host Memory (64KB)                                                        │
+│        │                                                                    │
+│        ▼                                                                    │
+│   ┌─────────────────┐                                                       │
+│   │   HostAXIMaster │  產生 512 AW + 8192 W flits                           │
+│   └────────┬────────┘                                                       │
+│            │                                                                │
+│            ▼                                                                │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  SlaveNI Output Buffer (共用)                                        │  │
+│   │  ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐         │  │
+│   │  │ W │ W │ W │ W │ W │ W │ W │AW │ W │ W │ W │ W │AW │...│         │  │
+│   │  └───┴───┴───┴───┴───┴───┴───┴─▲─┴───┴───┴───┴───┴───┴───┘         │  │
+│   │                                │                                    │  │
+│   │                         HoL Blocking Point #1                       │  │
+│   │                         AW 被前面的 W 阻擋                            │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│            │                                                                │
+│            ▼                                                                │
+│   ┌─────────────────┐                                                       │
+│   │ RoutingSelector │  選擇 Edge Router (based on hop count + credits)     │
+│   └────────┬────────┘                                                       │
+│            │                                                                │
+│     ┌──────┴──────┬───────────┬───────────┐                                │
+│     ▼             ▼           ▼           ▼                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  Edge Router Request Buffer (共用)                                    │  │
+│  │  ┌───┬───┬───┬───┬───┬───┬───┐                                       │  │
+│  │  │ W │ W │ W │AW │ W │ W │...│   ← HoL Blocking Point #2             │  │
+│  │  └───┴───┴───┴─▲─┴───┴───┴───┘                                       │  │
+│  │                │                                                      │  │
+│  │         AW 再次被 W 阻擋                                               │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│            │                                                                │
+│            ▼                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  5×4 Mesh (Compute Router Request Buffers - 共用)                     │  │
+│  │                                                                       │  │
+│  │  每一跳的 Request Buffer 都可能發生 HoL Blocking                       │  │
+│  │  ┌───┬───┬───┬───┬───┐                                               │  │
+│  │  │ W │ W │AW │ W │...│   ← HoL Blocking Point #3, #4, ...            │  │
+│  │  └───┴───┴─▲─┴───┴───┘                                               │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│            │                                                                │
+│            ▼                                                                │
+│   ┌─────────────────┐                                                       │
+│   │    MasterNI     │   ← Latency 測量終點                                  │
+│   │  (16 nodes)     │     latency = current_time - injection_cycle         │
+│   └─────────────────┘                                                       │
+│                                                                             │
+│  結果：                                                                      │
+│    - 某些 AW flit 幸運地前面沒有 W → Min Latency = 3 cycles                 │
+│    - 某些 AW flit 每一跳都被 W 擋住 → Max Latency = 114 cycles              │
+│    - Latency Variance = 114 - 3 = 111 cycles                               │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### AXI Mode - 無 HoL Blocking
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         AXI MODE DATAFLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Host Memory (64KB)                                                        │
+│        │                                                                    │
+│        ▼                                                                    │
+│   ┌─────────────────┐                                                       │
+│   │   HostAXIMaster │  產生 512 AW + 8192 W flits                           │
+│   └────────┬────────┘                                                       │
+│            │                                                                │
+│            ▼                                                                │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  SlaveNI Output Buffers (獨立)                                       │  │
+│   │                                                                      │  │
+│   │  AW Buffer: ┌───┬───┬───┬───┬───┐   ← AW 獨立排隊，不受 W 影響       │  │
+│   │             │AW │AW │AW │AW │...│                                   │  │
+│   │             └───┴───┴───┴───┴───┘                                   │  │
+│   │                                                                      │  │
+│   │  W Buffer:  ┌───┬───┬───┬───┬───┬───┬───┬───┐   ← W 獨立排隊        │  │
+│   │             │ W │ W │ W │ W │ W │ W │ W │...│                       │  │
+│   │             └───┴───┴───┴───┴───┴───┴───┴───┘                       │  │
+│   │                                                                      │  │
+│   │  AR Buffer: ┌───┬───┬───┐   ← AR 獨立排隊（本測試未使用）             │  │
+│   │             │   │   │   │                                           │  │
+│   │             └───┴───┴───┘                                           │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│            │           │                                                    │
+│            ▼           ▼                                                    │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  RoutingSelector (AXI Mode)                                          │  │
+│   │  AXIModeEdgeRouterPort × 4 rows                                      │  │
+│   │  ┌──────────┬──────────┬──────────┐                                 │  │
+│   │  │ AW Port  │  W Port  │ AR Port  │  ← 獨立 port，獨立 wire          │  │
+│   │  └────┬─────┴────┬─────┴────┬─────┘                                 │  │
+│   └───────┼──────────┼──────────┼───────────────────────────────────────┘  │
+│           │          │          │                                          │
+│           ▼          ▼          ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  AXIModeEdgeRouter (5 Sub-Routers)                                   │  │
+│   │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐        │  │
+│   │  │   AW   │  │   W    │  │   AR   │  │   B    │  │   R    │        │  │
+│   │  │ Router │  │ Router │  │ Router │  │ Router │  │ Router │        │  │
+│   │  │┌─┬─┬─┐│  │┌─┬─┬─┐ │  │┌─┬─┬─┐ │  │        │  │        │        │  │
+│   │  ││A│A│A││  ││W│W│W│ │  ││ │ │ │ │  │        │  │        │        │  │
+│   │  │└─┴─┴─┘│  │└─┴─┴─┘ │  │└─┴─┴─┘ │  │        │  │        │        │  │
+│   │  └───┬───┘  └───┬────┘  └───┬────┘  └────────┘  └────────┘        │  │
+│   │      │          │           │                                      │  │
+│   │      │    獨立路徑，互不干擾  │                                      │  │
+│   └──────┼──────────┼───────────┼──────────────────────────────────────┘  │
+│          ▼          ▼           ▼                                          │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  5×4 Mesh (AXIModeRouter - 5 Sub-Routers each)                       │  │
+│   │                                                                      │  │
+│   │  AW_Router: ┌─┬─┬─┐     W_Router: ┌─┬─┬─┬─┬─┐                       │  │
+│   │             │A│A│A│               │W│W│W│W│W│                       │  │
+│   │             └─┴─┴─┘               └─┴─┴─┴─┴─┘                       │  │
+│   │                │                       │                            │  │
+│   │                │     獨立 Sub-Router    │                            │  │
+│   │                │     無 Cross-Channel   │                            │  │
+│   │                │     Blocking          │                            │  │
+│   │                ▼                       ▼                            │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                    │                       │                               │
+│                    ▼                       ▼                               │
+│   ┌─────────────────┐                                                       │
+│   │    MasterNI     │   ← Latency 測量終點                                  │
+│   │  (16 nodes)     │     latency = current_time - injection_cycle         │
+│   └─────────────────┘                                                       │
+│                                                                             │
+│  結果：                                                                      │
+│    - 所有 AW flit 經歷相似的排隊時間                                         │
+│    - 所有 W flit 經歷相似的排隊時間                                          │
+│    - Min Latency = 3 cycles, Max Latency = 6 cycles                        │
+│    - Latency Variance = 6 - 3 = 3 cycles                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 為何 Total Cycles 相近但 Latency Variance 差異巨大？
+
+這是兩個不同維度的指標：
+
+| 指標 | 測量對象 | 代表意義 |
+|------|---------|---------|
+| **Total Cycles** | 整個傳輸完成時間 | Network Throughput (總吞吐量) |
+| **Latency Variance** | 個別 flit 延遲分布 | Network Fairness / QoS (公平性/可預測性) |
+
+#### 類比說明
+
+想像高速公路的車流：
+
+| 情境 | General Mode | AXI Mode |
+|------|-------------|----------|
+| **車道配置** | 大卡車(W)和轎車(AW)共用車道 | 大卡車專用道 + 轎車專用道 |
+| **總通過時間** | ~8,267 秒（總流量一樣） | ~8,203 秒 |
+| **個別車輛時間差異** | 很大（轎車可能被卡車擋很久） | 很小（各走各的道路） |
+
+#### 詳細分析
+
+1. **Total Cycles 相近的原因**：
+   - 網路總頻寬（throughput）相同
+   - 瓶頸是 flit 總數量（8,704 flits），不是 HoL blocking
+   - 兩種 mode 使用相同的 XY routing 和 wormhole switching
+
+2. **Latency Variance 差異巨大的原因**：
+   - **General Mode**：AW/W 在每一跳共用 buffer，W burst 阻擋 AW
+     - 幸運的 AW：前面沒有 W → 快速通過（3 cycles）
+     - 不幸的 AW：每一跳都被 W 擋 → 延遲累積（114 cycles）
+   - **AXI Mode**：AW/W 有獨立 Sub-Router，互不干擾
+     - 所有 flit 經歷相似的排隊延遲（3-6 cycles）
+
+### 結論
+
+| 結論 | 說明 |
+|------|------|
+| ✅ **AXI Mode 消除 HoL Blocking** | Latency Variance 降低 97.3% |
+| ✅ **Throughput 相近** | 網路頻寬利用率相當 |
+| ✅ **AXI Mode 適合 QoS 需求** | 延遲可預測，適合 real-time 應用 |
+| ⚠️ **General Mode 延遲不可預測** | 高 variance 對 QoS 敏感應用不利 |
+
+---
+
 ## Trade-off 決策指南
 
 ### 決策矩陣
@@ -530,18 +857,14 @@ AR Channel: ┌────┬────┬────┐
 - 可先用行為模型模擬比較
 - 根據模擬結果選擇最佳方案
 
-### 模擬驗證建議
+### 模擬驗證結論
 
-在做最終決策前，建議：
+本專案已完成兩種架構的行為模型並進行實際測試，詳見[模擬驗證結果](#模擬驗證結果)章節。
 
-1. **建立兩種架構的行為模型**
-2. **使用實際流量 pattern 測試**
-3. **比較關鍵指標**：
-   - 平均延遲
-   - 延遲變異 (jitter)
-   - 吞吐量
-   - 資源利用率
-4. **評估面積/效能比**
+**關鍵發現**：
+- **Throughput 差異小** (-0.8%)：瓶頸在網路頻寬，非 HoL blocking
+- **Latency Variance 差異大** (-97.3%)：AXI Mode 顯著改善延遲可預測性
+- **QoS 需求**：若應用對延遲穩定性敏感，強烈建議 AXI Mode
 
 ---
 
@@ -554,5 +877,6 @@ AR Channel: ┌────┬────┬────┐
 
 ---
 
-*文件版本: 1.0*
-*最後更新: 2025-01-14*
+*文件版本: 1.3*
+*最後更新: 2026-01-15*
+*更新內容: 新增模擬驗證結果章節（4KB Broadcast Write 效能比較）*

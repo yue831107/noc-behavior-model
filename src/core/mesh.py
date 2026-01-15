@@ -13,9 +13,11 @@ from typing import Optional, Dict, List, Tuple
 
 from .router import (
     Router, EdgeRouter, Direction, RouterConfig, RouterPort,
-    PortWire, create_router
+    PortWire, create_router, ChannelMode,
+    AXIModeRouter, AXIModeEdgeRouter
 )
 from .ni import SlaveNI, MasterNI, NIConfig
+from .flit import AxiChannel
 from ..address.address_map import SystemAddressMap, AddressMapConfig
 
 
@@ -25,6 +27,9 @@ class MeshConfig:
     cols: int = 5                   # Total columns (including edge)
     rows: int = 4                   # Total rows
     edge_column: int = 0            # Edge router column (no NI)
+
+    # Physical channel mode
+    channel_mode: ChannelMode = ChannelMode.GENERAL
 
     # Router configuration
     router_config: RouterConfig = field(default_factory=RouterConfig)
@@ -39,6 +44,8 @@ class MeshConfig:
             raise ValueError("cols must be at least 2")
         if self.rows < 1:
             raise ValueError("rows must be at least 1")
+        # Propagate channel_mode to router_config
+        self.router_config.channel_mode = self.channel_mode
 
     @property
     def compute_cols(self) -> range:
@@ -110,8 +117,16 @@ class Mesh:
         self.edge_routers: List[EdgeRouter] = []
 
         # Wire connections (for valid/ready signal propagation)
+        # General Mode: Req/Resp separation
         self._req_wires: List[PortWire] = []
         self._resp_wires: List[PortWire] = []
+
+        # AXI Mode: 5-channel separation
+        self._aw_wires: List[PortWire] = []
+        self._w_wires: List[PortWire] = []
+        self._ar_wires: List[PortWire] = []
+        self._b_wires: List[PortWire] = []
+        self._r_wires: List[PortWire] = []
 
         # Statistics
         self.stats = MeshStats()
@@ -123,21 +138,30 @@ class Mesh:
 
     def _build_mesh(self) -> None:
         """Create all routers and NIs."""
+        is_axi_mode = self.config.channel_mode == ChannelMode.AXI
+
         for y in range(self.config.rows):
             for x in range(self.config.cols):
                 coord = (x, y)
 
-                # Create router
-                if x == self.config.edge_column:
-                    # Edge router (no NI)
-                    router = EdgeRouter(coord, self.config.router_config)
-                    self.edge_routers.append(router)
+                # Create router based on channel mode
+                if is_axi_mode:
+                    # AXI Mode: 5 Sub-Routers per node
+                    if x == self.config.edge_column:
+                        router = AXIModeEdgeRouter(coord, self.config.router_config)
+                        self.edge_routers.append(router)
+                    else:
+                        router = AXIModeRouter(coord, self.config.router_config)
                 else:
-                    # Compute node router
-                    router = Router(coord, self.config.router_config)
+                    # General Mode: 2 Sub-Routers per node
+                    if x == self.config.edge_column:
+                        router = EdgeRouter(coord, self.config.router_config)
+                        self.edge_routers.append(router)
+                    else:
+                        router = Router(coord, self.config.router_config)
 
-                    # Create Master NI for this compute node
-                    # Master NI has AXI Master interface to access local Memory
+                # Create Master NI for compute nodes (both modes)
+                if x != self.config.edge_column:
                     node_id = self.address_map.get_node_id(coord)
                     ni = MasterNI(
                         coord=coord,
@@ -176,64 +200,133 @@ class Mesh:
 
     def _connect_bidirectional(
         self,
-        router1: Router,
+        router1,
         dir1: Direction,
-        router2: Router,
+        router2,
         dir2: Direction
     ) -> None:
         """
         Connect two routers bidirectionally using PortWire.
 
-        Both Req and Resp networks are connected via wires
-        that propagate valid/ready signals.
+        General Mode: Req/Resp networks (2 wires per direction pair)
+        AXI Mode: 5 channel networks (5 wires per direction pair)
         """
-        # Request network - create PortWire
-        req_wire = PortWire(
-            router1.get_req_port(dir1),
-            router2.get_req_port(dir2)
-        )
-        self._req_wires.append(req_wire)
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: Connect all 5 channels
+            # AW channel
+            aw_wire = PortWire(
+                router1.get_aw_port(dir1),
+                router2.get_aw_port(dir2)
+            )
+            self._aw_wires.append(aw_wire)
 
-        # Response network - create PortWire
-        resp_wire = PortWire(
-            router1.get_resp_port(dir1),
-            router2.get_resp_port(dir2)
-        )
-        self._resp_wires.append(resp_wire)
+            # W channel
+            w_wire = PortWire(
+                router1.get_w_port(dir1),
+                router2.get_w_port(dir2)
+            )
+            self._w_wires.append(w_wire)
+
+            # AR channel
+            ar_wire = PortWire(
+                router1.get_ar_port(dir1),
+                router2.get_ar_port(dir2)
+            )
+            self._ar_wires.append(ar_wire)
+
+            # B channel
+            b_wire = PortWire(
+                router1.get_b_port(dir1),
+                router2.get_b_port(dir2)
+            )
+            self._b_wires.append(b_wire)
+
+            # R channel
+            r_wire = PortWire(
+                router1.get_r_port(dir1),
+                router2.get_r_port(dir2)
+            )
+            self._r_wires.append(r_wire)
+        else:
+            # General Mode: Req/Resp networks
+            # Request network
+            req_wire = PortWire(
+                router1.get_req_port(dir1),
+                router2.get_req_port(dir2)
+            )
+            self._req_wires.append(req_wire)
+
+            # Response network
+            resp_wire = PortWire(
+                router1.get_resp_port(dir1),
+                router2.get_resp_port(dir2)
+            )
+            self._resp_wires.append(resp_wire)
 
     def _connect_nis(self) -> None:
         """Connect NIs to their local routers."""
         for coord, ni in self.nis.items():
             router = self.routers[coord]
 
-            # Create virtual ports for NI connections
-            # Router Req LOCAL -> NI (requests going to local NI)
-            # NI -> Router Resp LOCAL (responses from local NI)
+            if self.config.channel_mode == ChannelMode.AXI:
+                # AXI Mode: Create virtual ports for all 5 channels
+                # Request channels: AW, W, AR
+                for channel in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
+                    ch_local = router.get_channel_port(channel, Direction.LOCAL)
+                    ni_ch_port = RouterPort(
+                        direction=Direction.LOCAL,
+                        buffer_depth=self.config.ni_config.req_buffer_depth,
+                        name=f"NI({coord})_{channel.name}_in"
+                    )
+                    ch_local.neighbor = ni_ch_port
+                    ni_ch_port.neighbor = ch_local
 
-            # For request path: router's LOCAL output needs a target
-            # We create a virtual RouterPort that acts as the NI's input
-            req_local = router.get_req_port(Direction.LOCAL)
-            ni_req_port = RouterPort(
-                direction=Direction.LOCAL,
-                buffer_depth=self.config.ni_config.req_buffer_depth,
-                name=f"NI({coord})_req_in"
-            )
-            # Bidirectional connection for proper credit flow
-            req_local.neighbor = ni_req_port
-            ni_req_port.neighbor = req_local  # For credit release when NI consumes flit
+                # Response channels: B, R
+                for channel in [AxiChannel.B, AxiChannel.R]:
+                    ch_local = router.get_channel_port(channel, Direction.LOCAL)
+                    ni_ch_port = RouterPort(
+                        direction=Direction.LOCAL,
+                        buffer_depth=self.config.ni_config.resp_buffer_depth,
+                        name=f"NI({coord})_{channel.name}_out"
+                    )
+                    ni_ch_port.neighbor = ch_local
 
-            # For response path: NI's output needs to reach router's LOCAL
-            resp_local = router.get_resp_port(Direction.LOCAL)
-            ni_resp_port = RouterPort(
-                direction=Direction.LOCAL,
-                buffer_depth=self.config.ni_config.resp_buffer_depth,
-                name=f"NI({coord})_resp_out"
-            )
-            ni_resp_port.neighbor = resp_local
+                # Store single virtual port for backward compatibility
+                # (Phase 3 will add per-channel port storage)
+                ni._router_req_port = router.get_aw_port(Direction.LOCAL).neighbor
+                ni._router_resp_port = RouterPort(
+                    direction=Direction.LOCAL,
+                    buffer_depth=self.config.ni_config.resp_buffer_depth,
+                    name=f"NI({coord})_resp_out"
+                )
+            else:
+                # General Mode: Create virtual ports for Req/Resp
+                # Router Req LOCAL -> NI (requests going to local NI)
+                # NI -> Router Resp LOCAL (responses from local NI)
 
-            # Store virtual ports for transfer logic
-            ni._router_req_port = ni_req_port
-            ni._router_resp_port = ni_resp_port
+                # For request path: router's LOCAL output needs a target
+                req_local = router.get_req_port(Direction.LOCAL)
+                ni_req_port = RouterPort(
+                    direction=Direction.LOCAL,
+                    buffer_depth=self.config.ni_config.req_buffer_depth,
+                    name=f"NI({coord})_req_in"
+                )
+                # Bidirectional connection for proper credit flow
+                req_local.neighbor = ni_req_port
+                ni_req_port.neighbor = req_local
+
+                # For response path: NI's output needs to reach router's LOCAL
+                resp_local = router.get_resp_port(Direction.LOCAL)
+                ni_resp_port = RouterPort(
+                    direction=Direction.LOCAL,
+                    buffer_depth=self.config.ni_config.resp_buffer_depth,
+                    name=f"NI({coord})_resp_out"
+                )
+                ni_resp_port.neighbor = resp_local
+
+                # Store virtual ports for transfer logic
+                ni._router_req_port = ni_req_port
+                ni._router_resp_port = ni_resp_port
 
     def get_router(self, coord: Tuple[int, int]) -> Optional[Router]:
         """Get router at coordinate."""
@@ -243,11 +336,15 @@ class Mesh:
         """Get NI at coordinate (only for compute nodes)."""
         return self.nis.get(coord)
 
-    def get_edge_router(self, row: int) -> Optional[EdgeRouter]:
-        """Get edge router at given row."""
+    def get_edge_router(self, row: int):
+        """
+        Get edge router at given row.
+
+        Returns EdgeRouter (General Mode) or AXIModeEdgeRouter (AXI Mode).
+        """
         coord = (self.config.edge_column, row)
         router = self.routers.get(coord)
-        if isinstance(router, EdgeRouter):
+        if isinstance(router, (EdgeRouter, AXIModeEdgeRouter)):
             return router
         return None
 
@@ -307,46 +404,96 @@ class Mesh:
 
     def _propagate_all_wires(self) -> None:
         """Propagate signals on all wires."""
-        for wire in self._req_wires:
-            wire.propagate_signals()
-        for wire in self._resp_wires:
-            wire.propagate_signals()
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: 5 channels
+            for wire in self._aw_wires:
+                wire.propagate_signals()
+            for wire in self._w_wires:
+                wire.propagate_signals()
+            for wire in self._ar_wires:
+                wire.propagate_signals()
+            for wire in self._b_wires:
+                wire.propagate_signals()
+            for wire in self._r_wires:
+                wire.propagate_signals()
+        else:
+            # General Mode: Req/Resp
+            for wire in self._req_wires:
+                wire.propagate_signals()
+            for wire in self._resp_wires:
+                wire.propagate_signals()
 
     def _handle_credit_release(self) -> None:
         """Handle credit release for all wires."""
-        for wire in self._req_wires:
-            wire.propagate_credit_release()
-        for wire in self._resp_wires:
-            wire.propagate_credit_release()
+        if self.config.channel_mode == ChannelMode.AXI:
+            # AXI Mode: 5 channels
+            for wire in self._aw_wires:
+                wire.propagate_credit_release()
+            for wire in self._w_wires:
+                wire.propagate_credit_release()
+            for wire in self._ar_wires:
+                wire.propagate_credit_release()
+            for wire in self._b_wires:
+                wire.propagate_credit_release()
+            for wire in self._r_wires:
+                wire.propagate_credit_release()
+        else:
+            # General Mode: Req/Resp
+            for wire in self._req_wires:
+                wire.propagate_credit_release()
+            for wire in self._resp_wires:
+                wire.propagate_credit_release()
 
     def _transfer_ni_flits(self, current_time: int) -> None:
         """Transfer flits between NIs and their local routers using signal interface."""
         for coord, ni in self.nis.items():
             router = self.routers[coord]
 
-            # Transfer from Router req_LOCAL output to NI (signal-based)
-            # Router sets out_valid/out_flit on LOCAL port when forwarding to NI
-            req_local = router.get_req_port(Direction.LOCAL)
-            if req_local.out_valid and req_local.out_flit is not None:
-                flit = req_local.out_flit
-                if ni.receive_req_flit(flit):
-                    # Simulate handshake: NI accepted the flit
-                    # Clear the router's output (as if ready was asserted)
-                    req_local.out_valid = False
-                    req_local.out_flit = None
-                    self.stats.total_req_flits += 1
+            if self.config.channel_mode == ChannelMode.AXI:
+                # AXI Mode: Check all 3 request channels (AW, W, AR)
+                for channel in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
+                    req_local = router.get_channel_port(channel, Direction.LOCAL)
+                    if req_local.out_valid and req_local.out_flit is not None:
+                        flit = req_local.out_flit
+                        if ni.receive_req_flit(flit):
+                            req_local.out_valid = False
+                            req_local.out_flit = None
+                            self.stats.total_req_flits += 1
 
-            # Transfer from NI response output to Router resp_LOCAL input
-            # Use signal-based interface: set in_valid/in_flit on router's LOCAL
-            resp_local = router.get_resp_port(Direction.LOCAL)
-            if ni.has_pending_response() and not resp_local.in_valid:
-                # Only transfer if router's LOCAL input is not already occupied
-                flit = ni.get_resp_flit()
-                if flit is not None:
-                    # Set input signals on router's LOCAL port
-                    resp_local.in_valid = True
-                    resp_local.in_flit = flit
-                    self.stats.total_resp_flits += 1
+                # AXI Mode: Responses go to B or R channel
+                # For now, use B channel for write responses, R for read
+                # (NI Phase 3 will add per-channel output selection)
+                if ni.has_pending_response():
+                    flit = ni.peek_resp_flit()
+                    if flit is not None:
+                        # Determine channel from flit's axi_ch
+                        resp_channel = flit.hdr.axi_ch
+                        resp_local = router.get_channel_port(resp_channel, Direction.LOCAL)
+                        if not resp_local.in_valid:
+                            flit = ni.get_resp_flit()
+                            if flit is not None:
+                                resp_local.in_valid = True
+                                resp_local.in_flit = flit
+                                self.stats.total_resp_flits += 1
+            else:
+                # General Mode: Single req/resp paths
+                # Transfer from Router req_LOCAL output to NI
+                req_local = router.get_req_port(Direction.LOCAL)
+                if req_local.out_valid and req_local.out_flit is not None:
+                    flit = req_local.out_flit
+                    if ni.receive_req_flit(flit):
+                        req_local.out_valid = False
+                        req_local.out_flit = None
+                        self.stats.total_req_flits += 1
+
+                # Transfer from NI response output to Router resp_LOCAL input
+                resp_local = router.get_resp_port(Direction.LOCAL)
+                if ni.has_pending_response() and not resp_local.in_valid:
+                    flit = ni.get_resp_flit()
+                    if flit is not None:
+                        resp_local.in_valid = True
+                        resp_local.in_flit = flit
+                        self.stats.total_resp_flits += 1
 
 
     def sample_stats(self) -> None:
@@ -419,7 +566,8 @@ def create_mesh(
     cols: int = 5,
     rows: int = 4,
     edge_column: int = 0,
-    buffer_depth: int = 4
+    buffer_depth: int = 4,
+    channel_mode: ChannelMode = ChannelMode.GENERAL
 ) -> Mesh:
     """
     Create a mesh with default configuration.
@@ -429,17 +577,22 @@ def create_mesh(
         rows: Number of rows.
         edge_column: Edge router column.
         buffer_depth: Router buffer depth.
+        channel_mode: Physical channel mode (GENERAL or AXI).
 
     Returns:
         Configured Mesh instance.
     """
-    router_config = RouterConfig(buffer_depth=buffer_depth)
+    router_config = RouterConfig(
+        buffer_depth=buffer_depth,
+        channel_mode=channel_mode
+    )
     ni_config = NIConfig(req_buffer_depth=buffer_depth, resp_buffer_depth=buffer_depth)
 
     config = MeshConfig(
         cols=cols,
         rows=rows,
         edge_column=edge_column,
+        channel_mode=channel_mode,
         router_config=router_config,
         ni_config=ni_config,
     )

@@ -13,13 +13,16 @@ Features:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple, Deque, Callable
+from typing import Optional, Dict, List, Tuple, Deque, Callable, Union
 from collections import deque
 from enum import Enum, auto
 
 from .flit import Flit, AxiChannel, encode_node_id
 from .buffer import FlitBuffer, CreditFlowControl
-from .router import RouterPort, Direction, EdgeRouter, PortWire
+from .router import (
+    RouterPort, Direction, EdgeRouter, PortWire,
+    ChannelMode, AXIModeEdgeRouter
+)
 from src.verification import GoldenManager, VerificationReport
 
 
@@ -31,6 +34,7 @@ class RoutingSelectorConfig:
     egress_buffer_depth: int = 8    # Egress buffer depth
     hop_weight: float = 1.0         # Hop count weight for path selection
     credit_weight: float = 1.0      # Credit weight for path selection
+    channel_mode: ChannelMode = ChannelMode.GENERAL  # Physical channel mode
 
 
 @dataclass
@@ -192,12 +196,196 @@ class EdgeRouterPort:
         )
 
 
+class AXIModeEdgeRouterPort:
+    """
+    Connection to a single AXI Mode Edge Router.
+
+    Unlike EdgeRouterPort which has 2 channels (req/resp),
+    this has 5 independent channels (AW, W, AR, B, R).
+
+    Request channels (Selector -> EdgeRouter): AW, W, AR
+    Response channels (EdgeRouter -> Selector): B, R
+    """
+
+    def __init__(
+        self,
+        row: int,
+        buffer_depth: int = 8
+    ):
+        """
+        Initialize AXI Mode edge router port.
+
+        Args:
+            row: Edge router row (0-3).
+            buffer_depth: Buffer depth for each channel.
+        """
+        self.row = row
+        self.coord = (0, row)
+        self._buffer_depth = buffer_depth
+
+        # Request channel ports (Selector -> EdgeRouter)
+        self._aw_port = RouterPort(
+            direction=Direction.LOCAL,
+            buffer_depth=buffer_depth,
+            name=f"Sel_aw_to_edge{row}"
+        )
+        self._w_port = RouterPort(
+            direction=Direction.LOCAL,
+            buffer_depth=buffer_depth,
+            name=f"Sel_w_to_edge{row}"
+        )
+        self._ar_port = RouterPort(
+            direction=Direction.LOCAL,
+            buffer_depth=buffer_depth,
+            name=f"Sel_ar_to_edge{row}"
+        )
+
+        # Response channel ports (EdgeRouter -> Selector)
+        self._b_port = RouterPort(
+            direction=Direction.LOCAL,
+            buffer_depth=buffer_depth,
+            name=f"Sel_b_from_edge{row}"
+        )
+        self._r_port = RouterPort(
+            direction=Direction.LOCAL,
+            buffer_depth=buffer_depth,
+            name=f"Sel_r_from_edge{row}"
+        )
+
+        # Wire connections (set during connect_edge_routers)
+        self._aw_wire: Optional[PortWire] = None
+        self._w_wire: Optional[PortWire] = None
+        self._ar_wire: Optional[PortWire] = None
+        self._b_wire: Optional[PortWire] = None
+        self._r_wire: Optional[PortWire] = None
+
+        # Connected edge router
+        self._edge_router: Optional["AXIModeEdgeRouter"] = None
+
+    def connect_edge_router(self, edge_router: "AXIModeEdgeRouter") -> None:
+        """Connect to an AXI Mode Edge Router."""
+        self._edge_router = edge_router
+
+    # =========================================================================
+    # Request Path Methods (Selector -> EdgeRouter)
+    # =========================================================================
+
+    def can_send_aw(self) -> bool:
+        """Check if AW channel can send."""
+        return self._aw_port.can_send()
+
+    def can_send_w(self) -> bool:
+        """Check if W channel can send."""
+        return self._w_port.can_send()
+
+    def can_send_ar(self) -> bool:
+        """Check if AR channel can send."""
+        return self._ar_port.can_send()
+
+    def set_aw_output(self, flit: Flit) -> bool:
+        """Set AW output."""
+        return self._aw_port.set_output(flit)
+
+    def set_w_output(self, flit: Flit) -> bool:
+        """Set W output."""
+        return self._w_port.set_output(flit)
+
+    def set_ar_output(self, flit: Flit) -> bool:
+        """Set AR output."""
+        return self._ar_port.set_output(flit)
+
+    def clear_aw_if_accepted(self) -> bool:
+        """Clear AW output if accepted."""
+        return self._aw_port.clear_output_if_accepted()
+
+    def clear_w_if_accepted(self) -> bool:
+        """Clear W output if accepted."""
+        return self._w_port.clear_output_if_accepted()
+
+    def clear_ar_if_accepted(self) -> bool:
+        """Clear AR output if accepted."""
+        return self._ar_port.clear_output_if_accepted()
+
+    # =========================================================================
+    # Response Path Methods (EdgeRouter -> Selector)
+    # =========================================================================
+
+    def update_b_ready(self) -> None:
+        """Update B channel ready signal."""
+        self._b_port.update_ready()
+
+    def update_r_ready(self) -> None:
+        """Update R channel ready signal."""
+        self._r_port.update_ready()
+
+    def sample_b_input(self) -> bool:
+        """Sample B input from wire."""
+        return self._b_port.sample_input()
+
+    def sample_r_input(self) -> bool:
+        """Sample R input from wire."""
+        return self._r_port.sample_input()
+
+    def clear_b_input_signals(self) -> None:
+        """Clear B input signals."""
+        self._b_port.clear_input_signals()
+
+    def clear_r_input_signals(self) -> None:
+        """Clear R input signals."""
+        self._r_port.clear_input_signals()
+
+    def get_b_response(self) -> Optional[Flit]:
+        """Get B response flit."""
+        return self._b_port.pop_for_routing()
+
+    def get_r_response(self) -> Optional[Flit]:
+        """Get R response flit."""
+        return self._r_port.pop_for_routing()
+
+    # =========================================================================
+    # Credit Management
+    # =========================================================================
+
+    @property
+    def aw_credits(self) -> int:
+        """Available AW credits."""
+        return self._aw_port._output_credit.credits if self._aw_port._output_credit else 0
+
+    @property
+    def w_credits(self) -> int:
+        """Available W credits."""
+        return self._w_port._output_credit.credits if self._w_port._output_credit else 0
+
+    @property
+    def ar_credits(self) -> int:
+        """Available AR credits."""
+        return self._ar_port._output_credit.credits if self._ar_port._output_credit else 0
+
+    @property
+    def b_occupancy(self) -> int:
+        """B buffer occupancy."""
+        return self._b_port._buffer.occupancy
+
+    @property
+    def r_occupancy(self) -> int:
+        """R buffer occupancy."""
+        return self._r_port._buffer.occupancy
+
+    def __repr__(self) -> str:
+        return (
+            f"AXIModeEdgeRouterPort(row={self.row}, "
+            f"aw_cr={self.aw_credits}, w_cr={self.w_credits}, ar_cr={self.ar_credits})"
+        )
+
+
 class RoutingSelector:
     """
     Routing Selector for V1 Architecture.
 
     Single entry/exit point between master NI and 2D mesh.
     Connects to 4 Edge Routers in Column 0 via Local ports.
+
+    Supports both General Mode (2 sub-routers) and AXI Mode (5 sub-routers).
     """
 
     def __init__(self, config: Optional[RoutingSelectorConfig] = None):
@@ -208,22 +396,31 @@ class RoutingSelector:
             config: Selector configuration.
         """
         self.config = config or RoutingSelectorConfig()
+        self._is_axi_mode = (self.config.channel_mode == ChannelMode.AXI)
 
         # Edge router ports (one per row: 0, 1, 2, 3)
-        self.edge_ports: Dict[int, EdgeRouterPort] = {}
-        for row in range(self.config.num_directions):
-            self.edge_ports[row] = EdgeRouterPort(
-                row=row,
-                buffer_depth=self.config.egress_buffer_depth
-            )
+        # Type depends on channel mode
+        self.edge_ports: Dict[int, Union[EdgeRouterPort, AXIModeEdgeRouterPort]] = {}
+        if self._is_axi_mode:
+            for row in range(self.config.num_directions):
+                self.edge_ports[row] = AXIModeEdgeRouterPort(
+                    row=row,
+                    buffer_depth=self.config.egress_buffer_depth
+                )
+        else:
+            for row in range(self.config.num_directions):
+                self.edge_ports[row] = EdgeRouterPort(
+                    row=row,
+                    buffer_depth=self.config.egress_buffer_depth
+                )
 
-        # Ingress buffer (from master NI)
+        # Ingress buffer (from master NI) - shared for all channels
         self.ingress_buffer = FlitBuffer(
             self.config.ingress_buffer_depth,
             "Sel_ingress"
         )
 
-        # Egress buffer (to master NI)
+        # Egress buffer (to master NI) - shared for all channels
         self.egress_buffer = FlitBuffer(
             self.config.egress_buffer_depth,
             "Sel_egress"
@@ -247,9 +444,9 @@ class RoutingSelector:
         """
         Connect to Edge Routers via PortWire.
 
-        For each edge router:
-        - Request Wire: EdgeRouterPort._req_port <-> EdgeRouter.req.LOCAL
-        - Response Wire: EdgeRouter.resp.LOCAL <-> EdgeRouterPort._resp_port
+        Supports both General Mode and AXI Mode:
+        - General Mode: 2 wires (req, resp)
+        - AXI Mode: 5 wires (AW, W, AR, B, R)
 
         Args:
             edge_routers: List of EdgeRouter instances.
@@ -262,30 +459,74 @@ class RoutingSelector:
             port = self.edge_ports[row]
             port.connect_edge_router(router)
 
-            # Request Wire: Selector._req_port <-> EdgeRouter.req.LOCAL
-            # Selector sends requests TO EdgeRouter's request network
-            req_local = router.req_router.ports[Direction.LOCAL]
-            port._req_wire = PortWire(port._req_port, req_local)
+            if self._is_axi_mode:
+                # AXI Mode: Connect 5 independent channel wires
+                self._connect_axi_mode_wires(port, router)
+            else:
+                # General Mode: Connect 2 wires (req, resp)
+                self._connect_general_mode_wires(port, router)
 
-            # Initialize credits based on EdgeRouter's buffer depth
-            port._req_port._output_credit = CreditFlowControl(
-                initial_credits=req_local._buffer_depth
-            )
+    def _connect_general_mode_wires(
+        self,
+        port: EdgeRouterPort,
+        router: EdgeRouter
+    ) -> None:
+        """Connect wires for General Mode (2 sub-routers)."""
+        # Request Wire: Selector._req_port <-> EdgeRouter.req.LOCAL
+        req_local = router.req_router.ports[Direction.LOCAL]
+        port._req_wire = PortWire(port._req_port, req_local)
 
-            # Response Wire: EdgeRouter.resp.LOCAL <-> Selector._resp_port
-            # Selector receives responses FROM EdgeRouter's response network
-            resp_local = router.resp_router.ports[Direction.LOCAL]
-            port._resp_wire = PortWire(resp_local, port._resp_port)
+        # Initialize credits based on EdgeRouter's buffer depth
+        port._req_port._output_credit = CreditFlowControl(
+            initial_credits=req_local._buffer_depth
+        )
 
-            # Initialize response port credits (for credit release back to EdgeRouter)
-            # EdgeRouter's resp_local output_credit should match Selector's resp buffer
-            resp_local._output_credit = CreditFlowControl(
-                initial_credits=port._buffer_depth
-            )
+        # Response Wire: EdgeRouter.resp.LOCAL <-> Selector._resp_port
+        resp_local = router.resp_router.ports[Direction.LOCAL]
+        port._resp_wire = PortWire(resp_local, port._resp_port)
 
-            # Note: Legacy _virtual_req_port/_virtual_resp_port aliases have been
-            # removed. Response collection now uses signal-based interface via
-            # sample_all_inputs() and wire propagation.
+        # Initialize response port credits
+        resp_local._output_credit = CreditFlowControl(
+            initial_credits=port._buffer_depth
+        )
+
+    def _connect_axi_mode_wires(
+        self,
+        port: AXIModeEdgeRouterPort,
+        router: "AXIModeEdgeRouter"
+    ) -> None:
+        """Connect wires for AXI Mode (5 sub-routers)."""
+        # Request channels: Selector -> EdgeRouter (AW, W, AR)
+        aw_local = router.aw_router.ports[Direction.LOCAL]
+        port._aw_wire = PortWire(port._aw_port, aw_local)
+        port._aw_port._output_credit = CreditFlowControl(
+            initial_credits=aw_local._buffer_depth
+        )
+
+        w_local = router.w_router.ports[Direction.LOCAL]
+        port._w_wire = PortWire(port._w_port, w_local)
+        port._w_port._output_credit = CreditFlowControl(
+            initial_credits=w_local._buffer_depth
+        )
+
+        ar_local = router.ar_router.ports[Direction.LOCAL]
+        port._ar_wire = PortWire(port._ar_port, ar_local)
+        port._ar_port._output_credit = CreditFlowControl(
+            initial_credits=ar_local._buffer_depth
+        )
+
+        # Response channels: EdgeRouter -> Selector (B, R)
+        b_local = router.b_router.ports[Direction.LOCAL]
+        port._b_wire = PortWire(b_local, port._b_port)
+        b_local._output_credit = CreditFlowControl(
+            initial_credits=port._buffer_depth
+        )
+
+        r_local = router.r_router.ports[Direction.LOCAL]
+        port._r_wire = PortWire(r_local, port._r_port)
+        r_local._output_credit = CreditFlowControl(
+            initial_credits=port._buffer_depth
+        )
 
     # =========================================================================
     # Phased Cycle Processing Methods (PortWire interface)
@@ -297,8 +538,13 @@ class RoutingSelector:
 
         Phase 1 of cycle processing.
         """
-        for port in self.edge_ports.values():
-            port.update_resp_ready()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                port.update_b_ready()
+                port.update_r_ready()
+        else:
+            for port in self.edge_ports.values():
+                port.update_resp_ready()
 
     def propagate_all_wires(self) -> None:
         """
@@ -306,11 +552,26 @@ class RoutingSelector:
 
         Phase 2 of cycle processing.
         """
-        for port in self.edge_ports.values():
-            if port._req_wire is not None:
-                port._req_wire.propagate_signals()
-            if port._resp_wire is not None:
-                port._resp_wire.propagate_signals()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                # Request wires
+                if port._aw_wire is not None:
+                    port._aw_wire.propagate_signals()
+                if port._w_wire is not None:
+                    port._w_wire.propagate_signals()
+                if port._ar_wire is not None:
+                    port._ar_wire.propagate_signals()
+                # Response wires
+                if port._b_wire is not None:
+                    port._b_wire.propagate_signals()
+                if port._r_wire is not None:
+                    port._r_wire.propagate_signals()
+        else:
+            for port in self.edge_ports.values():
+                if port._req_wire is not None:
+                    port._req_wire.propagate_signals()
+                if port._resp_wire is not None:
+                    port._resp_wire.propagate_signals()
 
     def sample_all_inputs(self) -> None:
         """
@@ -318,8 +579,13 @@ class RoutingSelector:
 
         Phase 3 of cycle processing.
         """
-        for port in self.edge_ports.values():
-            port.sample_resp_input()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                port.sample_b_input()
+                port.sample_r_input()
+        else:
+            for port in self.edge_ports.values():
+                port.sample_resp_input()
 
     def clear_all_input_signals(self) -> None:
         """
@@ -327,8 +593,13 @@ class RoutingSelector:
 
         Phase 3b of cycle processing.
         """
-        for port in self.edge_ports.values():
-            port.clear_resp_input_signals()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                port.clear_b_input_signals()
+                port.clear_r_input_signals()
+        else:
+            for port in self.edge_ports.values():
+                port.clear_resp_input_signals()
 
     def clear_accepted_outputs(self) -> None:
         """
@@ -336,8 +607,14 @@ class RoutingSelector:
 
         Phase 4 of cycle processing.
         """
-        for port in self.edge_ports.values():
-            port.clear_req_if_accepted()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                port.clear_aw_if_accepted()
+                port.clear_w_if_accepted()
+                port.clear_ar_if_accepted()
+        else:
+            for port in self.edge_ports.values():
+                port.clear_req_if_accepted()
 
     def handle_credit_release(self) -> None:
         """
@@ -345,11 +622,26 @@ class RoutingSelector:
 
         Phase 5 of cycle processing.
         """
-        for port in self.edge_ports.values():
-            if port._req_wire is not None:
-                port._req_wire.propagate_credit_release()
-            if port._resp_wire is not None:
-                port._resp_wire.propagate_credit_release()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                # Request wires
+                if port._aw_wire is not None:
+                    port._aw_wire.propagate_credit_release()
+                if port._w_wire is not None:
+                    port._w_wire.propagate_credit_release()
+                if port._ar_wire is not None:
+                    port._ar_wire.propagate_credit_release()
+                # Response wires
+                if port._b_wire is not None:
+                    port._b_wire.propagate_credit_release()
+                if port._r_wire is not None:
+                    port._r_wire.propagate_credit_release()
+        else:
+            for port in self.edge_ports.values():
+                if port._req_wire is not None:
+                    port._req_wire.propagate_credit_release()
+                if port._resp_wire is not None:
+                    port._resp_wire.propagate_credit_release()
 
     def clear_edge_resp_outputs(self) -> None:
         """
@@ -359,11 +651,19 @@ class RoutingSelector:
         port output is not cleared by mesh.process_cycle() to avoid timing
         issues, so Selector must clear it explicitly after sampling.
         """
-        for port in self.edge_ports.values():
-            if port._edge_router is not None:
-                resp_local = port._edge_router.resp_router.ports[Direction.LOCAL]
-                # Clear if handshake completed (out_valid=True and in_ready=True)
-                resp_local.clear_output_if_accepted()
+        if self._is_axi_mode:
+            for port in self.edge_ports.values():
+                if port._edge_router is not None:
+                    # Clear B and R channel outputs
+                    b_local = port._edge_router.b_router.ports[Direction.LOCAL]
+                    b_local.clear_output_if_accepted()
+                    r_local = port._edge_router.r_router.ports[Direction.LOCAL]
+                    r_local.clear_output_if_accepted()
+        else:
+            for port in self.edge_ports.values():
+                if port._edge_router is not None:
+                    resp_local = port._edge_router.resp_router.ports[Direction.LOCAL]
+                    resp_local.clear_output_if_accepted()
 
     # =========================================================================
     # Request/Response Interface
@@ -440,6 +740,8 @@ class RoutingSelector:
 
         Sets request outputs on EdgeRouterPorts. The actual transfer
         to EdgeRouters happens during signal propagation phase.
+
+        In AXI Mode, routes to channel-specific ports (AW, W, AR).
         """
         while not self.ingress_buffer.is_empty():
             flit = self.ingress_buffer.peek()
@@ -452,29 +754,68 @@ class RoutingSelector:
                 self.stats.req_blocked_no_credit += 1
                 break
 
-            # Check if we can send via signal interface
             edge_port = self.edge_ports[best_row]
-            if not edge_port.can_send_request():
-                self.stats.req_blocked_no_credit += 1
-                break
+
+            # Check if we can send via signal interface (mode-specific)
+            if self._is_axi_mode:
+                if not self._can_send_axi_request(edge_port, flit):
+                    self.stats.req_blocked_no_credit += 1
+                    break
+            else:
+                if not edge_port.can_send_request():
+                    self.stats.req_blocked_no_credit += 1
+                    break
 
             # Pop and set output for wire propagation
             flit = self.ingress_buffer.pop()
 
             # Update flit source to edge router coord (for response routing)
-            # This is critical for XY routing to work correctly
             flit.hdr.src_id = encode_node_id(edge_port.coord)
 
-            if edge_port.set_req_output(flit):
+            # Set output (mode-specific)
+            if self._is_axi_mode:
+                success = self._set_axi_req_output(edge_port, flit)
+            else:
+                success = edge_port.set_req_output(flit)
+
+            if success:
                 self.stats.req_flits_injected += 1
                 self.stats.path_selections[best_row] += 1
-                # Clear packet path tracking after TAIL is sent
                 self._clear_packet_path(flit)
             else:
-                # Should not happen - we checked can_send_request_signal
                 # Put back to buffer
                 self.ingress_buffer.push(flit)
                 break
+
+    def _can_send_axi_request(
+        self,
+        port: AXIModeEdgeRouterPort,
+        flit: Flit
+    ) -> bool:
+        """Check if AXI Mode port can send flit on its channel."""
+        channel = flit.hdr.axi_ch
+        if channel == AxiChannel.AW:
+            return port.can_send_aw()
+        elif channel == AxiChannel.W:
+            return port.can_send_w()
+        elif channel == AxiChannel.AR:
+            return port.can_send_ar()
+        return False
+
+    def _set_axi_req_output(
+        self,
+        port: AXIModeEdgeRouterPort,
+        flit: Flit
+    ) -> bool:
+        """Set AXI Mode request output on correct channel."""
+        channel = flit.hdr.axi_ch
+        if channel == AxiChannel.AW:
+            return port.set_aw_output(flit)
+        elif channel == AxiChannel.W:
+            return port.set_w_output(flit)
+        elif channel == AxiChannel.AR:
+            return port.set_ar_output(flit)
+        return False
 
     def _select_ingress_path(self, flit: Flit) -> Optional[int]:
         """
@@ -499,11 +840,14 @@ class RoutingSelector:
         if packet_key in self._packet_path:
             assigned_row = self._packet_path[packet_key]
             port = self.edge_ports[assigned_row]
-            if port.can_send_request():
-                # NOTE: Don't delete path here - it will be deleted after successful send
+            # Check if can send (mode-specific)
+            if self._is_axi_mode:
+                can_send = self._can_send_axi_request(port, flit)
+            else:
+                can_send = port.can_send_request()
+            if can_send:
                 return assigned_row
             else:
-                # Path blocked - wait
                 return None
 
         # New packet - select best path
@@ -512,14 +856,19 @@ class RoutingSelector:
         min_cost = float('inf')
 
         for row, port in self.edge_ports.items():
-            if not port.can_send_request():
+            # Check if can send (mode-specific)
+            if self._is_axi_mode:
+                can_send = self._can_send_axi_request(port, flit)
+                credits = self._get_axi_credits(port, flit)
+            else:
+                can_send = port.can_send_request()
+                credits = port.available_credits
+
+            if not can_send:
                 continue
 
             # Calculate hop count from this edge router to destination
             hops = self._calculate_hops((0, row), dest)
-
-            # Get available credits
-            credits = port.available_credits
 
             # Calculate cost
             cost = (self.config.hop_weight * hops -
@@ -535,6 +884,21 @@ class RoutingSelector:
                 self._packet_path[packet_key] = best_row
 
         return best_row
+
+    def _get_axi_credits(
+        self,
+        port: AXIModeEdgeRouterPort,
+        flit: Flit
+    ) -> int:
+        """Get AXI Mode credits for flit's channel."""
+        channel = flit.hdr.axi_ch
+        if channel == AxiChannel.AW:
+            return port.aw_credits
+        elif channel == AxiChannel.W:
+            return port.w_credits
+        elif channel == AxiChannel.AR:
+            return port.ar_credits
+        return 0
 
     def _clear_packet_path(self, flit: Flit) -> None:
         """Clear packet path after successful TAIL send."""
@@ -564,11 +928,18 @@ class RoutingSelector:
         Process egress path: collect responses from mesh.
 
         Uses buffer occupancy-based arbitration.
+        In AXI Mode, collects from both B and R channels.
         """
         if self.egress_buffer.is_full():
             return
 
-        # Select edge router to read from
+        if self._is_axi_mode:
+            self._process_egress_axi_mode()
+        else:
+            self._process_egress_general_mode()
+
+    def _process_egress_general_mode(self) -> None:
+        """Process egress for General Mode (single resp channel)."""
         row = self._select_egress_source()
         if row is None:
             return
@@ -579,9 +950,39 @@ class RoutingSelector:
             self.egress_buffer.push(flit)
             self.stats.resp_flits_collected += 1
 
+    def _process_egress_axi_mode(self) -> None:
+        """Process egress for AXI Mode (B and R channels)."""
+        # Try to collect from both B and R channels
+        # Use round-robin between channels to avoid starvation
+        channels = ['B', 'R']
+        start_idx = self._egress_rr_index % 2
+
+        for i in range(2):
+            if self.egress_buffer.is_full():
+                break
+
+            ch_idx = (start_idx + i) % 2
+            channel = channels[ch_idx]
+
+            # Select row with highest occupancy for this channel
+            row = self._select_egress_source_axi(channel)
+            if row is None:
+                continue
+
+            port = self.edge_ports[row]
+            if channel == 'B':
+                flit = port.get_b_response()
+            else:
+                flit = port.get_r_response()
+
+            if flit is not None:
+                self.egress_buffer.push(flit)
+                self.stats.resp_flits_collected += 1
+                self._egress_rr_index = ch_idx + 1
+
     def _select_egress_source(self) -> Optional[int]:
         """
-        Select edge router to read response from.
+        Select edge router to read response from (General Mode).
 
         Strategy: Read from the edge router with highest buffer occupancy
         to prevent upstream blocking.
@@ -610,6 +1011,31 @@ class RoutingSelector:
 
         return best_row
 
+    def _select_egress_source_axi(self, channel: str) -> Optional[int]:
+        """
+        Select edge router to read from for AXI Mode.
+
+        Args:
+            channel: 'B' or 'R'
+
+        Returns:
+            Row to read from, or None if all empty.
+        """
+        max_occupancy = 0
+        best_row = None
+
+        for row, port in self.edge_ports.items():
+            if channel == 'B':
+                occ = port.b_occupancy
+            else:
+                occ = port.r_occupancy
+
+            if occ > max_occupancy:
+                max_occupancy = occ
+                best_row = row
+
+        return best_row
+
     def has_pending_requests(self) -> bool:
         """Check if requests are pending."""
         return not self.ingress_buffer.is_empty()
@@ -626,7 +1052,13 @@ class RoutingSelector:
         print(f"  Egress buffer: {self.egress_buffer.occupancy}/{self.config.egress_buffer_depth}")
         print(f"  Edge ports:")
         for row, port in self.edge_ports.items():
-            print(f"    Row {row}: credit={port.available_credits}, resp_occ={port.resp_occupancy}")
+            if self._is_axi_mode:
+                axi_port = port  # type: AXIModeEdgeRouterPort
+                print(f"    Row {row}: AW={axi_port.aw_credits}, W={axi_port.w_credits}, "
+                      f"AR={axi_port.ar_credits}, B_occ={axi_port.b_occupancy}, R_occ={axi_port.r_occupancy}")
+            else:
+                gen_port = port  # type: EdgeRouterPort
+                print(f"    Row {row}: credit={gen_port.available_credits}, resp_occ={gen_port.resp_occupancy}")
         print(f"  Stats:")
         print(f"    Req received: {self.stats.req_flits_received}")
         print(f"    Req injected: {self.stats.req_flits_injected}")
@@ -678,37 +1110,56 @@ class V1System:
         This provides accurate buffer utilization even in fast mode
         where flits move through in a single cycle.
         """
+        from .router import AXIModeRouter
+
         occupancy = {}
         for coord, router in self.mesh.routers.items():
             occ = 0
-            # Req router
-            for port in router.req_router.ports.values():
-                if hasattr(port, 'input_buffer'):
-                    occ += port.input_buffer.occupancy
-                # Count pending output (flit waiting to be accepted)
-                if port.out_valid and port.out_flit is not None:
-                    occ += 1
-            # Flits in pipeline stages
-            occ += router.req_router.flits_in_pipeline
 
-            # Resp router
-            for port in router.resp_router.ports.values():
-                if hasattr(port, 'input_buffer'):
-                    occ += port.input_buffer.occupancy
-                if port.out_valid and port.out_flit is not None:
-                    occ += 1
-            occ += router.resp_router.flits_in_pipeline
+            if isinstance(router, AXIModeRouter):
+                # AXI Mode: 5 Sub-Routers
+                for channel_router in router._channel_routers.values():
+                    for port in channel_router.ports.values():
+                        if hasattr(port, 'input_buffer'):
+                            occ += port.input_buffer.occupancy
+                        if port.out_valid and port.out_flit is not None:
+                            occ += 1
+                    occ += channel_router.flits_in_pipeline
+            else:
+                # General Mode: 2 Sub-Routers
+                for port in router.req_router.ports.values():
+                    if hasattr(port, 'input_buffer'):
+                        occ += port.input_buffer.occupancy
+                    if port.out_valid and port.out_flit is not None:
+                        occ += 1
+                occ += router.req_router.flits_in_pipeline
+
+                for port in router.resp_router.ports.values():
+                    if hasattr(port, 'input_buffer'):
+                        occ += port.input_buffer.occupancy
+                    if port.out_valid and port.out_flit is not None:
+                        occ += 1
+                occ += router.resp_router.flits_in_pipeline
 
             occupancy[coord] = occ
         return occupancy
 
     def get_flit_stats(self) -> Dict[Tuple[int, int], int]:
-        """Get flit forwarding stats for each router (req + resp)."""
+        """Get flit forwarding stats for each router (all sub-routers)."""
+        from .router import AXIModeRouter
+
         stats = {}
         for coord, router in self.mesh.routers.items():
-            count = router.req_router.stats.flits_forwarded
-            if hasattr(router, 'resp_router'):
-                count += router.resp_router.stats.flits_forwarded
+            count = 0
+            if isinstance(router, AXIModeRouter):
+                # AXI Mode: 5 Sub-Routers
+                for channel_router in router._channel_routers.values():
+                    count += channel_router.stats.flits_forwarded
+            else:
+                # General Mode: 2 Sub-Routers
+                count = router.req_router.stats.flits_forwarded
+                if hasattr(router, 'resp_router'):
+                    count += router.resp_router.stats.flits_forwarded
             stats[coord] = count
         return stats
 
@@ -749,6 +1200,7 @@ class V1System:
         max_outstanding: int = 16,
         selector_config: Optional[RoutingSelectorConfig] = None,
         host_memory: Optional["Memory"] = None,
+        channel_mode: ChannelMode = ChannelMode.GENERAL,
     ):
         """
         Initialize V1 System.
@@ -760,6 +1212,7 @@ class V1System:
             max_outstanding: Max outstanding transactions (affects NI and safety buffer sizing).
             selector_config: Selector configuration.
             host_memory: Optional Host Memory for DMA transfers.
+            channel_mode: Physical channel mode (GENERAL or AXI).
         """
         from .mesh import create_mesh
         from .ni import SlaveNI, NIConfig
@@ -769,13 +1222,15 @@ class V1System:
         self._mesh_rows = mesh_rows
         self._buffer_depth = buffer_depth
         self._max_outstanding = max_outstanding
+        self.channel_mode = channel_mode
 
         # Create mesh
         self.mesh = create_mesh(
             cols=mesh_cols,
             rows=mesh_rows,
             edge_column=0,
-            buffer_depth=buffer_depth
+            buffer_depth=buffer_depth,
+            channel_mode=channel_mode,
         )
 
         # Create selector with safe buffer depths
@@ -790,7 +1245,11 @@ class V1System:
             selector_config = RoutingSelectorConfig(
                 ingress_buffer_depth=safe_ingress_depth,
                 egress_buffer_depth=safe_ingress_depth,
+                channel_mode=channel_mode,  # Pass channel mode to selector
             )
+        else:
+            # Ensure channel_mode is set even if config was provided
+            selector_config.channel_mode = channel_mode
         self.selector = RoutingSelector(selector_config)
 
         # Connect selector to edge routers
@@ -857,7 +1316,7 @@ class V1System:
         while self.master_ni.req_ni.has_pending_output():
             if self.selector.ingress_buffer.is_full():
                 break
-            flit = self.master_ni.get_req_flit()
+            flit = self.master_ni.get_req_flit(self.current_time)
             if flit is not None:
                 if not self.selector.accept_request(flit):
                     break
@@ -998,10 +1457,16 @@ class V1System:
         """
         from ..axi.interface import AXI_AR, AXISize
 
+        # Calculate burst length based on size
+        beat_size = 8  # AXISize.SIZE_8 = 8 bytes per beat
+        burst_length = (size + beat_size - 1) // beat_size  # Round up
+        burst_length = max(1, min(burst_length, 256))  # AXI4 max is 256 beats
+        arlen = burst_length - 1  # arlen = burst_length - 1
+
         ar = AXI_AR(
             arid=axi_id,
             araddr=addr,
-            arlen=0,  # Single beat
+            arlen=arlen,
             arsize=AXISize.SIZE_8,
         )
 
@@ -1313,37 +1778,58 @@ class NoCSystem:
         This provides accurate buffer utilization even in fast mode
         where flits move through in a single cycle.
         """
+        from .router import AXIModeRouter
+
         occupancy = {}
         for coord, router in self.mesh.routers.items():
             occ = 0
-            # Req router
-            for port in router.req_router.ports.values():
-                if hasattr(port, 'input_buffer'):
-                    occ += port.input_buffer.occupancy
-                # Count pending output (flit waiting to be accepted)
-                if port.out_valid and port.out_flit is not None:
-                    occ += 1
-            # Flits in pipeline stages
-            occ += router.req_router.flits_in_pipeline
 
-            # Resp router
-            for port in router.resp_router.ports.values():
-                if hasattr(port, 'input_buffer'):
-                    occ += port.input_buffer.occupancy
-                if port.out_valid and port.out_flit is not None:
-                    occ += 1
-            occ += router.resp_router.flits_in_pipeline
+            if isinstance(router, AXIModeRouter):
+                # AXI Mode: 5 Sub-Routers
+                for channel_router in router._channel_routers.values():
+                    for port in channel_router.ports.values():
+                        if hasattr(port, 'input_buffer'):
+                            occ += port.input_buffer.occupancy
+                        if port.out_valid and port.out_flit is not None:
+                            occ += 1
+                    occ += channel_router.flits_in_pipeline
+            else:
+                # General Mode: 2 Sub-Routers
+                for port in router.req_router.ports.values():
+                    if hasattr(port, 'input_buffer'):
+                        occ += port.input_buffer.occupancy
+                    if port.out_valid and port.out_flit is not None:
+                        occ += 1
+                occ += router.req_router.flits_in_pipeline
+
+                for port in router.resp_router.ports.values():
+                    if hasattr(port, 'input_buffer'):
+                        occ += port.input_buffer.occupancy
+                    if port.out_valid and port.out_flit is not None:
+                        occ += 1
+                occ += router.resp_router.flits_in_pipeline
 
             occupancy[coord] = occ
         return occupancy
 
     def get_flit_stats(self) -> Dict[Tuple[int, int], int]:
-        """Get flit forwarding stats for each router (req + resp)."""
+        """Get flit forwarding stats for each router (all channels)."""
+        from .router import AXIModeRouter
+
         stats = {}
         for coord, router in self.mesh.routers.items():
-            count = router.req_router.stats.flits_forwarded
-            if hasattr(router, 'resp_router'):
-                count += router.resp_router.stats.flits_forwarded
+            count = 0
+
+            if isinstance(router, AXIModeRouter):
+                # AXI Mode: Sum all 5 channels
+                for channel_router in router._channel_routers.values():
+                    count += channel_router.stats.flits_forwarded
+            else:
+                # General Mode: Req + Resp
+                count = router.req_router.stats.flits_forwarded
+                if hasattr(router, 'resp_router'):
+                    count += router.resp_router.stats.flits_forwarded
+
             stats[coord] = count
         return stats
 
@@ -1379,6 +1865,7 @@ class NoCSystem:
         mesh_rows: int = 4,
         buffer_depth: int = 4,
         memory_size: int = 0x100000000,
+        channel_mode: ChannelMode = ChannelMode.GENERAL,
     ):
         """
         Initialize NoC-to-NoC System.
@@ -1388,6 +1875,7 @@ class NoCSystem:
             mesh_rows: Mesh rows.
             buffer_depth: Router buffer depth.
             memory_size: Local memory size per node.
+            channel_mode: Physical channel mode (GENERAL or AXI).
         """
         from .mesh import create_mesh
         from src.testbench.node_controller import NodeController
@@ -1397,16 +1885,18 @@ class NoCSystem:
         self.mesh_rows = mesh_rows
         self.buffer_depth = buffer_depth
         self.memory_size = memory_size
+        self.channel_mode = channel_mode
 
         # Calculate number of compute nodes (exclude edge column)
         self.num_nodes = (mesh_cols - 1) * mesh_rows
 
-        # Create mesh
+        # Create mesh with specified channel mode
         self.mesh = create_mesh(
             cols=mesh_cols,
             rows=mesh_rows,
             edge_column=0,
-            buffer_depth=buffer_depth
+            buffer_depth=buffer_depth,
+            channel_mode=channel_mode
         )
 
         # Create NodeControllers for each compute node
@@ -1415,6 +1905,7 @@ class NoCSystem:
             use_user_signal_routing=True,
             req_buffer_depth=buffer_depth,
             resp_buffer_depth=buffer_depth,
+            channel_mode=channel_mode,
         )
 
         for node_id in range(self.num_nodes):
@@ -1678,7 +2169,7 @@ class NoCSystem:
         These are injected into the local router's request LOCAL input.
         Handles back-pressure by buffering rejected flits for retry.
         """
-        from .router import Direction
+        from .router import Direction, AXIModeRouter
 
         for node_id, controller in self.node_controllers.items():
             coord = controller.coord
@@ -1689,7 +2180,7 @@ class NoCSystem:
             # First, try to inject any pending flit from previous cycle
             if node_id in self._pending_req_flits:
                 pending = self._pending_req_flits[node_id]
-                if router.receive_request(Direction.LOCAL, pending):
+                if self._inject_flit_to_router(router, pending):
                     # Successfully injected pending flit
                     del self._pending_req_flits[node_id]
                 # If still failed, keep it pending and skip getting new flit
@@ -1700,10 +2191,32 @@ class NoCSystem:
             flit = controller.get_outgoing_flit()
             if flit is not None:
                 # Inject into router's request LOCAL port
-                success = router.receive_request(Direction.LOCAL, flit)
+                success = self._inject_flit_to_router(router, flit)
                 if not success:
                     # Router couldn't accept - buffer for retry next cycle
                     self._pending_req_flits[node_id] = flit
+
+    def _inject_flit_to_router(self, router, flit) -> bool:
+        """
+        Inject flit into router, handling both General and AXI modes.
+
+        Args:
+            router: Router instance (Router or AXIModeRouter)
+            flit: Flit to inject
+
+        Returns:
+            True if accepted, False if rejected.
+        """
+        from .router import Direction, AXIModeRouter
+
+        if isinstance(router, AXIModeRouter):
+            # AXI Mode: route to channel-specific Sub-Router
+            channel = flit.hdr.axi_ch
+            sub_router = router.get_channel_router(channel)
+            return sub_router.receive_flit(Direction.LOCAL, flit)
+        else:
+            # General Mode: use receive_request
+            return router.receive_request(Direction.LOCAL, flit)
 
     def _deliver_flits_from_mesh(self) -> None:
         """
@@ -1714,7 +2227,7 @@ class NoCSystem:
 
         Also inject response flits from mesh.nis (MasterNI) into router.
         """
-        from .router import Direction
+        from .router import Direction, AXIModeRouter
 
         for node_id, controller in self.node_controllers.items():
             coord = controller.coord
@@ -1722,16 +2235,35 @@ class NoCSystem:
             if router is None:
                 continue
 
-            # Check if router's response LOCAL output has a flit for us
-            # This happens when a response is routed back to this node
-            resp_local = router.get_resp_port(Direction.LOCAL)
-            if resp_local.out_valid and resp_local.out_flit is not None:
-                flit = resp_local.out_flit
-                # Deliver to NodeController's SlaveNI response path
-                if controller.receive_response_flit(flit):
-                    # Clear router's output
-                    resp_local.out_valid = False
-                    resp_local.out_flit = None
+            if isinstance(router, AXIModeRouter):
+                # AXI Mode: check both B and R channels
+                self._deliver_channel_flit(router.get_b_port(Direction.LOCAL), controller)
+                self._deliver_channel_flit(router.get_r_port(Direction.LOCAL), controller)
+            else:
+                # General Mode: check response LOCAL port
+                resp_local = router.get_resp_port(Direction.LOCAL)
+                self._deliver_channel_flit(resp_local, controller)
+
+    def _deliver_channel_flit(self, port, controller) -> bool:
+        """
+        Deliver flit from a router port to controller.
+
+        Args:
+            port: RouterPort to check for outgoing flit
+            controller: NodeController to deliver to
+
+        Returns:
+            True if flit was delivered, False otherwise.
+        """
+        if port.out_valid and port.out_flit is not None:
+            flit = port.out_flit
+            # Deliver to NodeController's SlaveNI response path
+            if controller.receive_response_flit(flit):
+                # Clear router's output
+                port.out_valid = False
+                port.out_flit = None
+                return True
+        return False
 
     @property
     def all_transfers_complete(self) -> bool:

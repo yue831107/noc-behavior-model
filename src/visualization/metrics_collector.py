@@ -12,6 +12,12 @@ from typing import Dict, List, Tuple, Optional, Union, Any, TYPE_CHECKING
 import statistics
 import numpy as np
 
+from ..metrics.booksim_metrics import (
+    BookSimMetrics,
+    SaturationStatus,
+    calculate_saturation_status,
+)
+
 if TYPE_CHECKING:
     from ..core.routing_selector import V1System, NoCSystem
     from ..core.mesh import Mesh
@@ -75,6 +81,9 @@ class MetricsCollector:
 
         # Latency tracking: key -> injection_cycle
         self._injection_log: Dict[Any, int] = {}
+
+        # BookSim2-style: zero-load latency reference
+        self._zero_load_latency: Optional[float] = None
 
     def _on_packet_arrived(self, packet_id: int, creation_time: int, arrival_time: int) -> None:
         """
@@ -504,6 +513,7 @@ class MetricsCollector:
         collector._mesh_cols = data.get('mesh_cols', 5)
         collector._mesh_rows = data.get('mesh_rows', 4)
         collector._injection_log = {}
+        collector._zero_load_latency = None
 
         # Override mesh property for loaded data
         collector.snapshots = []
@@ -529,5 +539,70 @@ class MetricsCollector:
                 latencies=s_data.get('latencies', []),
             )
             collector.snapshots.append(snapshot)
-        
+
         return collector
+
+    # =========================================================================
+    # BookSim2-Style Metrics
+    # =========================================================================
+
+    def set_zero_load_latency(self, latency: float) -> None:
+        """
+        Set the zero-load latency (L₀) reference value.
+
+        This should be calculated using TheoryValidator.calculate_zero_load_latency()
+        based on the source and destination coordinates.
+
+        Args:
+            latency: Zero-load latency in cycles.
+        """
+        self._zero_load_latency = latency
+
+    def get_booksim_metrics(self) -> BookSimMetrics:
+        """
+        Get BookSim2-style performance metrics.
+
+        Returns a BookSimMetrics dataclass with:
+        - throughput: packets/cycle (measured)
+        - latency statistics
+        - saturation detection (L > 3×L₀)
+
+        Note: Call set_zero_load_latency() before using this method
+        to enable saturation detection.
+
+        Returns:
+            BookSimMetrics dataclass with all metrics.
+        """
+        latency_stats = self.get_latency_stats()
+        avg_latency = latency_stats.get("avg", 0.0)
+        min_latency = latency_stats.get("min", 0)
+        max_latency = latency_stats.get("max", 0)
+
+        # Get cycle and packet counts
+        total_cycles = self.snapshots[-1].cycle if self.snapshots else 1
+        total_packets = latency_stats.get("samples", 0)
+
+        # Calculate throughput (packets/cycle)
+        throughput = total_packets / total_cycles if total_cycles > 0 else 0.0
+
+        # Determine zero-load latency
+        zero_load = self._zero_load_latency
+        if zero_load is None or zero_load <= 0:
+            # Fallback: use minimum observed latency as approximation
+            zero_load = float(min_latency) if min_latency > 0 else 1.0
+
+        # Calculate saturation factor
+        saturation_factor = avg_latency / zero_load if zero_load > 0 else 1.0
+        saturation_status = calculate_saturation_status(saturation_factor)
+
+        return BookSimMetrics(
+            throughput=throughput,
+            total_packets=total_packets,
+            total_cycles=total_cycles,
+            avg_latency=avg_latency,
+            min_latency=float(min_latency),
+            max_latency=float(max_latency),
+            zero_load_latency=zero_load,
+            saturation_factor=saturation_factor,
+            saturation_status=saturation_status,
+        )

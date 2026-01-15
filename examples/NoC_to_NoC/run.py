@@ -8,12 +8,17 @@ Usage:
     py -3 run.py neighbor -P payload/          # Load from payload files
     py -3 run.py --all                         # Run all traffic patterns
     py -3 run.py --all -P payload/             # All patterns with payload files
+    py -3 run.py --all --mode axi              # Run with AXI Mode (5 Sub-Routers)
 
 Memory Patterns (dynamic generation):
     sequential, random, constant, node_id, address, walking_ones, walking_zeros, checkerboard
 
 Traffic Patterns:
     neighbor, shuffle, bit_reverse, random, transpose
+
+Channel Modes:
+    general   - 2 Sub-Routers (Req + Resp), default
+    axi       - 5 Sub-Routers (AW + W + AR + B + R), no HoL blocking
 
 Generate payload files first:
     make gen_noc_payload                       # Generate payload/node_XX.bin files
@@ -30,25 +35,113 @@ from datetime import datetime
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+from typing import List, Tuple
+
 from src.core import NoCSystem
+from src.core.router import ChannelMode
 from src.config import load_noc_traffic_config, NoCTrafficConfig, TrafficPattern
 from src.traffic import TrafficPatternGenerator
 from src.visualization import MetricsCollector
+from src.metrics import BookSimMetrics, SaturationStatus
 
 
-def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
+def calculate_noc_zero_load_latency(
+    node_configs: List,
+    mesh_cols: int = 5,
+    mesh_rows: int = 4
+) -> float:
     """
-    Validate performance metrics against theoretical bounds and consistency.
+    Calculate average zero-load latency (L0) for NoC-to-NoC traffic.
 
-    Uses validators from tests/performance to check:
-    - TheoryValidator: Throughput <= max, Buffer utilization in [0,1]
-    - ConsistencyValidator: Little's Law, Flit Conservation
+    For NoC-to-NoC, each node sends to its destination based on the traffic
+    pattern. This calculates the average Manhattan distance + overhead.
 
-    Note: For NoC-to-NoC, throughput validation uses V1 architecture bounds
-    which may not apply. Throughput validation is skipped for NoC-to-NoC.
+    Args:
+        node_configs: List of NodeTrafficConfig with src_node_id and dest_coord
+        mesh_cols: Total mesh columns (default 5, with col 0 as edge)
+        mesh_rows: Mesh rows (default 4)
+
+    Returns:
+        Average zero-load latency in cycles
+    """
+    from src.verification import TheoryValidator
+    from src.verification.theory_validator import MeshConfig
+
+    mesh_config = MeshConfig(cols=mesh_cols, rows=mesh_rows, edge_column=0)
+    validator = TheoryValidator(mesh_config=mesh_config)
+
+    # Compute columns (excluding edge column 0)
+    compute_cols = mesh_cols - 1
+
+    total_latency = 0.0
+    count = 0
+
+    for nc in node_configs:
+        # Convert src_node_id to mesh coordinate
+        # node_id = row * compute_cols + (col - 1) for col > 0
+        src_col = (nc.src_node_id % compute_cols) + 1
+        src_row = nc.src_node_id // compute_cols
+        src_coord = (src_col, src_row)
+
+        # dest_coord is already in mesh coordinates (col, row)
+        dest_coord = nc.dest_coord
+
+        # Calculate zero-load latency for this src-dest pair
+        l0 = validator.calculate_zero_load_latency(src_coord, dest_coord)
+        total_latency += l0
+        count += 1
+
+    return total_latency / count if count > 0 else 0.0
+
+
+def print_booksim_metrics(
+    metrics: BookSimMetrics,
+    title: str = "Performance Metrics (BookSim2-Style)"
+) -> None:
+    """
+    Print BookSim2-style performance metrics summary.
+
+    Args:
+        metrics: BookSimMetrics dataclass
+        title: Header title
+    """
+    print("\n" + "=" * 70)
+    print(f" {title}")
+    print("=" * 70)
+    print(f"Throughput:          {metrics.throughput:.4f} packets/cycle")
+    print(f"Total Packets:       {metrics.total_packets}")
+    print(f"Total Cycles:        {metrics.total_cycles}")
+    print("-" * 70)
+    print(f"Average Latency:     {metrics.avg_latency:.1f} cycles")
+    print(f"Min Latency:         {metrics.min_latency:.1f} cycles")
+    print(f"Max Latency:         {metrics.max_latency:.1f} cycles")
+    print("-" * 70)
+    print(f"Zero-Load Latency:   {metrics.zero_load_latency:.1f} cycles (L0)")
+    print(f"Normalized Latency:  {metrics.saturation_factor:.2f} (L/L0)")
+    print(f"Saturation Status:   {metrics.saturation_status.value.upper()}")
+    if metrics.is_saturated:
+        print("  WARNING: Network is SATURATED (L > 3*L0)")
+    print("=" * 70)
+
+
+def validate_performance_metrics(
+    metrics: dict,
+    zero_load_latency: float = None,
+    verbose: bool = True
+) -> bool:
+    """
+    Validate performance metrics using BookSim2-style checks.
+
+    Validations:
+    - Latency: L >= L0 (zero-load), saturation detection (L > 3*L0)
+    - Buffer utilization: [0, 1] range
+    - Flit Conservation: Sent = Received
+
+    Note: Little's Law is skipped for NoC-to-NoC (burst traffic pattern).
 
     Args:
         metrics: Dict with performance metrics
+        zero_load_latency: Theoretical minimum latency (L0). If None, skip latency validation.
         verbose: Print validation results
 
     Returns:
@@ -57,15 +150,26 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
     all_passed = True
     results = []
 
-    # === Theory Validation ===
+    # === Theory Validation (BookSim2-Style) ===
     try:
         from src.verification import TheoryValidator
         theory_validator = TheoryValidator()
 
-        # Skip throughput validation for NoC-to-NoC (different architecture)
-        # Only validate buffer utilization
+        # 1. Latency validation with saturation detection
+        if 'avg_latency' in metrics and zero_load_latency is not None:
+            is_valid, msg, details = theory_validator.validate_latency(
+                avg_latency=metrics['avg_latency'],
+                zero_load_latency=zero_load_latency
+            )
+            results.append(('Latency', is_valid, msg))
+            if not is_valid:
+                all_passed = False
+
+        # 2. Buffer utilization validation
         if 'buffer_utilization' in metrics and metrics['buffer_utilization'] is not None:
-            is_valid, msg = theory_validator.validate_buffer_utilization(metrics['buffer_utilization'])
+            is_valid, msg = theory_validator.validate_buffer_utilization(
+                metrics['buffer_utilization']
+            )
             results.append(('Buffer Util', is_valid, msg))
             if not is_valid:
                 all_passed = False
@@ -78,13 +182,9 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
     # === Consistency Validation ===
     try:
         from src.verification import ConsistencyValidator
-        consistency_validator = ConsistencyValidator(tolerance=0.50)  # 50% tolerance for NoC
+        consistency_validator = ConsistencyValidator(tolerance=0.50)
 
-        # Little's Law: L = λ × W
-        # SKIP for NoC-to-NoC: Little's Law assumes steady-state arrival rate,
-        # but NoC-to-NoC has burst traffic (all nodes send simultaneously).
-        # The throughput metric measures completion rate, not arrival rate,
-        # making the standard formula inapplicable for burst transfers.
+        # Little's Law: SKIP for NoC-to-NoC (burst traffic pattern)
         results.append(("Little's Law", True, "OK (skipped - burst traffic)"))
 
         # Flit Conservation: Sent = Received
@@ -102,7 +202,7 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
 
     # Print results
     if verbose and results:
-        print_section("Performance Validation")
+        print_section("Performance Validation (BookSim2-Style)")
         for name, is_valid, msg in results:
             status = "PASS" if is_valid else "FAIL"
             print(f"  {name + ':':<17} {status}")
@@ -137,7 +237,8 @@ def run_traffic_pattern(
     pattern: str,
     memory_pattern: str = "sequential",
     payload_dir: str = None,
-    verbose: bool = True
+    verbose: bool = True,
+    channel_mode: ChannelMode = ChannelMode.GENERAL
 ) -> dict:
     """
     Run NoC-to-NoC traffic pattern test.
@@ -147,6 +248,7 @@ def run_traffic_pattern(
         memory_pattern: Memory initialization pattern (ignored if payload_dir set).
         payload_dir: Directory with node_XX.bin files (overrides memory_pattern).
         verbose: Enable verbose output.
+        channel_mode: Physical channel mode (GENERAL or AXI).
 
     Returns:
         Result dictionary.
@@ -173,17 +275,21 @@ def run_traffic_pattern(
             transfer_size=256,
         )
 
-    # Create system
+    # Create system with specified channel mode
     system = NoCSystem(
         mesh_cols=config.mesh_cols,
         mesh_rows=config.mesh_rows,
         buffer_depth=4,
         memory_size=0x10000,
+        channel_mode=channel_mode,
     )
+
+    mode_name = "AXI" if channel_mode == ChannelMode.AXI else "General"
 
     if verbose:
         print_section("Configuration")
         print(f"  Pattern:       {config.pattern.value}")
+        print(f"  Channel Mode:  {mode_name}")
         print(f"  Mesh Size:     {config.mesh_cols}x{config.mesh_rows}")
         print(f"  Compute Nodes: {system.num_nodes}")
         print(f"  Transfer Size: {config.transfer_size} bytes/node")
@@ -241,29 +347,26 @@ def run_traffic_pattern(
     # Create metrics collector for detailed performance data
     collector = MetricsCollector(system, capture_interval=1)
 
+    # === Connect MasterNI callbacks for BookSim2-style per-flit latency tracking ===
+    # This matches Host-to-NoC's approach: track each flit's latency individually
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
+
     sim_start = time.perf_counter()
     system.start_all_transfers()
 
-    # Record injection time for all nodes (all start at cycle 0)
-    for node_id in system.node_controllers.keys():
-        collector.record_injection(node_id, cycle=0)
-
-    # Track which nodes have completed (for latency tracking)
-    completed_nodes: set = set()
-
     # Run simulation with metrics collection
+    # Note: Per-flit latency is now tracked via MasterNI callbacks (like Host-to-NoC)
     max_cycles = 10000
     cycles = 0
     while not system.all_transfers_complete and cycles < max_cycles:
         system.process_cycle()
         collector.capture()
         cycles += 1
-
-        # Check for newly completed nodes and record ejection
-        for node_id, controller in system.node_controllers.items():
-            if node_id not in completed_nodes and controller.is_transfer_complete:
-                collector.record_ejection(node_id, cycles)
-                completed_nodes.add(node_id)
 
     sim_end = time.perf_counter()
     sim_time_ms = (sim_end - sim_start) * 1000
@@ -272,78 +375,41 @@ def run_traffic_pattern(
         print(f"  Simulation completed in {cycles} cycles")
         print(f"  Wall-clock time: {sim_time_ms:.2f} ms")
 
-    # === Collect Performance Metrics (using MetricsCollector) ===
-    total_bytes = config.transfer_size * system.num_nodes
+    # === Performance Metrics (BookSim2-Style) ===
+    # Calculate zero-load latency based on traffic pattern
+    zero_load_latency = calculate_noc_zero_load_latency(
+        node_configs, mesh_cols=config.mesh_cols, mesh_rows=config.mesh_rows
+    )
+    collector.set_zero_load_latency(zero_load_latency)
 
-    # Get statistics from collector
-    throughput_bytes_per_cycle = collector.get_throughput()
-    latency_stats = collector.get_latency_stats()
-    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)  # 20 routers × 4 depth × 5 ports
-
-    # Extract latency values
-    min_latency = latency_stats['min']
-    max_latency = latency_stats['max']
-    avg_latency = latency_stats['avg']
-    std_latency = latency_stats['std']
-
-    # Extract buffer values
-    peak_buffer_util = buffer_stats['peak']
-    avg_buffer_util = buffer_stats['avg']
-
-    # Router flit statistics (still needed for router-level details)
-    flit_stats = system.get_flit_stats()
-    total_flits = sum(flit_stats.values())
-    active_routers = sum(1 for v in flit_stats.values() if v > 0)
-    avg_flits_per_router = total_flits / len(flit_stats) if flit_stats else 0
-    max_flits_router = max(flit_stats.values()) if flit_stats else 0
-
-    # Active buffer statistics (for detailed output)
-    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
-    active_occupancies = [x for x in buffer_occupancies if x > 0]
-    active_avg_buffer = sum(active_occupancies) / len(active_occupancies) if active_occupancies else 0
-    active_pct = len(active_occupancies) / len(buffer_occupancies) * 100 if buffer_occupancies else 0
+    # Get BookSim2-style metrics
+    booksim_metrics = collector.get_booksim_metrics()
 
     if verbose:
-        print_section("Performance Metrics")
-        print(f"  Total Cycles:      {cycles}")
-        print(f"  Total Data:        {total_bytes} bytes")
-        print(f"  Throughput:        {throughput_bytes_per_cycle:.2f} bytes/cycle")
+        print_booksim_metrics(booksim_metrics)
         print(f"  Simulation Speed:  {cycles / sim_time_ms * 1000:.0f} cycles/sec")
 
+        # Additional router statistics
+        flit_stats = system.get_flit_stats()
+        total_flits = sum(flit_stats.values())
+        active_routers = sum(1 for v in flit_stats.values() if v > 0)
         print_section("Router Statistics")
         print(f"  Total Flits:       {total_flits}")
         print(f"  Active Routers:    {active_routers}/{len(flit_stats)}")
-        print(f"  Avg Flits/Router:  {avg_flits_per_router:.1f}")
-        print(f"  Max Flits (router):{max_flits_router}")
-
-        print_section("Latency Distribution")
-        if latency_stats['samples'] > 0:
-            print(f"  Samples:           {latency_stats['samples']}")
-            print(f"  Min Latency:       {min_latency} cycles")
-            print(f"  Max Latency:       {max_latency} cycles")
-            print(f"  Avg Latency:       {avg_latency:.2f} cycles")
-            print(f"  Std Dev:           {std_latency:.2f} cycles")
-        else:
-            print(f"  No latency samples collected")
-
-        print_section("Buffer Utilization")
-        print(f"  Peak Occupancy:    {peak_buffer_util} flits")
-        print(f"  Avg Occupancy:     {avg_buffer_util:.3f} flits")
-        print(f"  Active Avg:        {active_avg_buffer:.2f} flits ({active_pct:.1f}% of cycles active)")
 
     # === Performance Validation ===
-    # Note: Flit conservation check is skipped for NoC-to-NoC because:
-    # - Each node has separate request/response paths
-    # - Aggregating across nodes doesn't give meaningful sent/received comparison
-
+    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': throughput_bytes_per_cycle,
+        'throughput': booksim_metrics.throughput * 32,
         'buffer_utilization': buffer_stats['utilization'],
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
-        # Flit conservation omitted - cross-node aggregation not meaningful
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
 
     # Golden Comparison / Verification
     if verbose:
@@ -400,12 +466,18 @@ def run_traffic_pattern(
     # Save metrics to latest.json for visualization
     metrics_dir = Path("output/metrics")
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    # Get router stats for result
+    flit_stats = system.get_flit_stats()
+    total_flits = sum(flit_stats.values())
+    active_routers = sum(1 for v in flit_stats.values() if v > 0)
+
     result = {
         'pattern': pattern,
+        'channel_mode': mode_name,
         'cycles': cycles,
-        'total_bytes': total_bytes,
-        'throughput': throughput_bytes_per_cycle,
+        'total_bytes': config.transfer_size * system.num_nodes,
+        'throughput': booksim_metrics.throughput * 32,  # bytes/cycle
         'pass_count': pass_count,
         'fail_count': fail_count,
         'sim_time_ms': sim_time_ms,
@@ -419,17 +491,17 @@ def run_traffic_pattern(
         # Router statistics
         'total_flits': total_flits,
         'active_routers': active_routers,
-        'avg_flits_per_router': avg_flits_per_router,
-        'max_flits_router': max_flits_router,
-        # Latency statistics
-        'latency_samples': latency_stats['samples'],
-        'min_latency': min_latency,
-        'max_latency': max_latency,
-        'avg_latency': avg_latency,
-        'std_latency': std_latency,
+        # Latency statistics (BookSim2-style)
+        'latency_samples': booksim_metrics.total_packets,
+        'min_latency': booksim_metrics.min_latency,
+        'max_latency': booksim_metrics.max_latency,
+        'avg_latency': booksim_metrics.avg_latency,
+        'zero_load_latency': booksim_metrics.zero_load_latency,
+        'saturation_factor': booksim_metrics.saturation_factor,
+        'saturation_status': booksim_metrics.saturation_status.value,
         # Buffer utilization
-        'peak_buffer_util': peak_buffer_util,
-        'avg_buffer_util': avg_buffer_util,
+        'peak_buffer_util': buffer_stats['peak'],
+        'avg_buffer_util': buffer_stats['avg'],
     }
     
     # Save as latest.json
@@ -447,23 +519,29 @@ def run_traffic_pattern(
 def run_all_patterns(
     memory_pattern: str = "sequential",
     payload_dir: str = None,
-    verbose: bool = True
+    verbose: bool = True,
+    channel_mode: ChannelMode = ChannelMode.GENERAL
 ) -> dict:
     """Run all traffic patterns."""
     patterns = ['neighbor', 'shuffle', 'bit_reverse', 'random', 'transpose']
     results = {}
 
+    mode_name = "AXI" if channel_mode == ChannelMode.AXI else "General"
+
     if verbose:
-        print_header("NoC-to-NoC Traffic Test Suite")
+        print_header(f"NoC-to-NoC Traffic Test Suite ({mode_name} Mode)")
         print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Running {len(patterns)} traffic patterns...")
+        print(f"Channel Mode: {mode_name}")
         if payload_dir:
             print(f"Memory Source: {payload_dir} (files)")
         else:
             print(f"Memory Source: {memory_pattern} (dynamic)")
 
     for pattern in patterns:
-        result = run_traffic_pattern(pattern, memory_pattern, payload_dir, verbose)
+        result = run_traffic_pattern(
+            pattern, memory_pattern, payload_dir, verbose, channel_mode
+        )
         results[pattern] = result
 
     # Print summary table
@@ -517,6 +595,8 @@ Examples:
   py -3 run.py neighbor -m random    Dynamic random data
   py -3 run.py neighbor -P payload/  Load from payload files
   py -3 run.py --all -P payload/     All patterns with payload files
+  py -3 run.py neighbor --mode axi   Run with AXI Mode (5 Sub-Routers)
+  py -3 run.py --all --mode axi      Compare all patterns in AXI Mode
 """
     )
     parser.add_argument('pattern', nargs='?', default='neighbor',
@@ -530,18 +610,27 @@ Examples:
                         help='Load memory from payload files (overrides -m)')
     parser.add_argument('--all', action='store_true',
                         help='Run all traffic patterns')
+    parser.add_argument('--mode', default='general',
+                        choices=['general', 'axi'],
+                        help='Physical channel mode (default: general)')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Quiet mode (minimal output)')
 
     args = parser.parse_args()
     verbose = not args.quiet
 
+    # Parse channel mode
+    channel_mode = ChannelMode.AXI if args.mode == 'axi' else ChannelMode.GENERAL
+
     if args.all:
-        results = run_all_patterns(args.memory_pattern, args.payload_dir, verbose)
+        results = run_all_patterns(
+            args.memory_pattern, args.payload_dir, verbose, channel_mode
+        )
         success = all(r['success'] for r in results.values())
     else:
         result = run_traffic_pattern(
-            args.pattern, args.memory_pattern, args.payload_dir, verbose
+            args.pattern, args.memory_pattern, args.payload_dir, verbose,
+            channel_mode
         )
         success = result['success']
 

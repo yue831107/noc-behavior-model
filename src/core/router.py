@@ -45,6 +45,24 @@ class Direction(Enum):
         return deltas[self]
 
 
+class ChannelMode(Enum):
+    """
+    NoC Physical Channel Mode.
+
+    GENERAL: 2 Sub-Routers (ReqRouter + RespRouter)
+             - AW/W/AR share Request channel
+             - B/R share Response channel
+             - Has Head-of-Line blocking
+
+    AXI: 5 Sub-Routers (AW + W + AR + B + R)
+         - Each AXI channel has independent Sub-Router
+         - No Head-of-Line blocking
+         - Requires 10 wires per direction (5 channels × in/out)
+    """
+    GENERAL = auto()  # 2 Sub-Routers (default, backward compatible)
+    AXI = auto()      # 5 Sub-Routers (independent channels)
+
+
 @dataclass
 class PipelineConfig:
     """
@@ -109,7 +127,8 @@ class RouterConfig:
     arbitration: str = "wormhole"   # Arbitration: "wormhole" (packet locking)
     switching: str = "wormhole"     # Switching: "wormhole" (default)
     pipeline: PipelineConfig = None # Pipeline configuration
-    
+    channel_mode: ChannelMode = ChannelMode.GENERAL  # Physical channel mode
+
     def __post_init__(self):
         if self.pipeline is None:
             self.pipeline = PipelineConfig.fast()
@@ -908,11 +927,14 @@ class XYRouter:
                 continue
 
             # Handle Wormhole locking
-            if popped_flit.is_head() and not popped_flit.is_single_flit():
-                self._arbiter.lock(in_dir, out_dir)
+            # In AXI mode, each channel is independent - bypass wormhole locking
+            # because there's no mux/demux and each flit routes independently
+            if self.config.channel_mode != ChannelMode.AXI:
+                if popped_flit.is_head() and not popped_flit.is_single_flit():
+                    self._arbiter.lock(in_dir, out_dir)
 
-            if popped_flit.is_tail() or popped_flit.is_single_flit():
-                self._arbiter.release(in_dir)
+                if popped_flit.is_tail() or popped_flit.is_single_flit():
+                    self._arbiter.release(in_dir)
 
             # Enter into pipeline or emit directly
             if len(self._active_stages) <= 1:
@@ -1360,7 +1382,7 @@ def create_router(
     coord: Tuple[int, int],
     is_edge: bool = False,
     config: Optional[RouterConfig] = None
-) -> Router:
+) -> "Router":
     """
     Factory function to create appropriate router type.
 
@@ -1370,8 +1392,346 @@ def create_router(
         config: Router configuration.
 
     Returns:
-        Router or EdgeRouter instance.
+        Router, EdgeRouter, AXIModeRouter, or AXIModeEdgeRouter instance.
     """
-    if is_edge:
-        return EdgeRouter(coord, config)
-    return Router(coord, config)
+    config = config or RouterConfig()
+
+    if config.channel_mode == ChannelMode.AXI:
+        if is_edge:
+            return AXIModeEdgeRouter(coord, config)
+        return AXIModeRouter(coord, config)
+    else:
+        if is_edge:
+            return EdgeRouter(coord, config)
+        return Router(coord, config)
+
+
+# =============================================================================
+# AXI Mode Channel-Specific Sub-Routers
+# =============================================================================
+
+class AWRouter(XYRouter):
+    """
+    AW (Write Address) Channel Router for AXI Mode.
+
+    Handles only AW flits. Inherits all XY routing logic from XYRouter.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None,
+        name: str = ""
+    ):
+        name = name or f"AWRouter({coord[0]},{coord[1]})"
+        super().__init__(coord, config, name)
+        self.axi_channel = AxiChannel.AW
+
+
+class WRouter(XYRouter):
+    """
+    W (Write Data) Channel Router for AXI Mode.
+
+    Handles only W flits. Inherits all XY routing logic from XYRouter.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None,
+        name: str = ""
+    ):
+        name = name or f"WRouter({coord[0]},{coord[1]})"
+        super().__init__(coord, config, name)
+        self.axi_channel = AxiChannel.W
+
+
+class ARRouter(XYRouter):
+    """
+    AR (Read Address) Channel Router for AXI Mode.
+
+    Handles only AR flits. Inherits all XY routing logic from XYRouter.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None,
+        name: str = ""
+    ):
+        name = name or f"ARRouter({coord[0]},{coord[1]})"
+        super().__init__(coord, config, name)
+        self.axi_channel = AxiChannel.AR
+
+
+class BRouter(XYRouter):
+    """
+    B (Write Response) Channel Router for AXI Mode.
+
+    Handles only B flits. Inherits all XY routing logic from XYRouter.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None,
+        name: str = ""
+    ):
+        name = name or f"BRouter({coord[0]},{coord[1]})"
+        super().__init__(coord, config, name)
+        self.axi_channel = AxiChannel.B
+
+
+class RRouter(XYRouter):
+    """
+    R (Read Data) Channel Router for AXI Mode.
+
+    Handles only R flits. Inherits all XY routing logic from XYRouter.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None,
+        name: str = ""
+    ):
+        name = name or f"RRouter({coord[0]},{coord[1]})"
+        super().__init__(coord, config, name)
+        self.axi_channel = AxiChannel.R
+
+
+# =============================================================================
+# AXI Mode Combined Router
+# =============================================================================
+
+class AXIModeRouter:
+    """
+    Combined Router with 5 independent AXI channel Sub-Routers.
+
+    Contains: AWRouter, WRouter, ARRouter, BRouter, RRouter
+    Each Sub-Router operates independently with its own PortWire connections.
+
+    This eliminates Head-of-Line blocking by giving each AXI channel
+    its own physical path through the network.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None
+    ):
+        """
+        Initialize AXI Mode combined router.
+
+        Args:
+            coord: Router coordinate (x, y).
+            config: Router configuration.
+        """
+        self.coord = coord
+        self.config = config or RouterConfig(channel_mode=ChannelMode.AXI)
+
+        # Create 5 channel-specific sub-routers
+        self.aw_router = AWRouter(coord, self.config)
+        self.w_router = WRouter(coord, self.config)
+        self.ar_router = ARRouter(coord, self.config)
+        self.b_router = BRouter(coord, self.config)
+        self.r_router = RRouter(coord, self.config)
+
+        # Channel to router mapping
+        self._channel_routers: Dict[AxiChannel, XYRouter] = {
+            AxiChannel.AW: self.aw_router,
+            AxiChannel.W: self.w_router,
+            AxiChannel.AR: self.ar_router,
+            AxiChannel.B: self.b_router,
+            AxiChannel.R: self.r_router,
+        }
+
+    def get_channel_router(self, channel: AxiChannel) -> XYRouter:
+        """Get Sub-Router for specific AXI channel."""
+        return self._channel_routers[channel]
+
+    def get_channel_port(
+        self,
+        channel: AxiChannel,
+        direction: Direction
+    ) -> "RouterPort":
+        """Get port for specific channel and direction."""
+        return self._channel_routers[channel].get_port(direction)
+
+    # Request channel accessors (for convenience)
+    def get_aw_port(self, direction: Direction) -> "RouterPort":
+        """Get AW channel port."""
+        return self.aw_router.get_port(direction)
+
+    def get_w_port(self, direction: Direction) -> "RouterPort":
+        """Get W channel port."""
+        return self.w_router.get_port(direction)
+
+    def get_ar_port(self, direction: Direction) -> "RouterPort":
+        """Get AR channel port."""
+        return self.ar_router.get_port(direction)
+
+    # Response channel accessors
+    def get_b_port(self, direction: Direction) -> "RouterPort":
+        """Get B channel port."""
+        return self.b_router.get_port(direction)
+
+    def get_r_port(self, direction: Direction) -> "RouterPort":
+        """Get R channel port."""
+        return self.r_router.get_port(direction)
+
+    # =========================================================================
+    # Phased Cycle Methods (for wire-based processing)
+    # =========================================================================
+
+    def update_all_ready(self) -> None:
+        """Phase 1: Update ready signals for all 5 channel routers."""
+        self.aw_router.update_all_ready()
+        self.w_router.update_all_ready()
+        self.ar_router.update_all_ready()
+        self.b_router.update_all_ready()
+        self.r_router.update_all_ready()
+
+    def sample_all_inputs(self) -> Dict[AxiChannel, int]:
+        """
+        Phase 2: Sample inputs for all 5 channel routers.
+
+        Returns:
+            Dict mapping channel to received flit count.
+        """
+        return {
+            AxiChannel.AW: self.aw_router.sample_all_inputs(),
+            AxiChannel.W: self.w_router.sample_all_inputs(),
+            AxiChannel.AR: self.ar_router.sample_all_inputs(),
+            AxiChannel.B: self.b_router.sample_all_inputs(),
+            AxiChannel.R: self.r_router.sample_all_inputs(),
+        }
+
+    def route_and_forward(
+        self,
+        current_time: int = 0
+    ) -> Dict[AxiChannel, List[Tuple[Flit, Direction]]]:
+        """
+        Phase 3: Route and forward flits for all 5 channel routers.
+
+        Returns:
+            Dict mapping channel to list of (flit, direction) tuples.
+        """
+        return {
+            AxiChannel.AW: self.aw_router.route_and_forward(current_time),
+            AxiChannel.W: self.w_router.route_and_forward(current_time),
+            AxiChannel.AR: self.ar_router.route_and_forward(current_time),
+            AxiChannel.B: self.b_router.route_and_forward(current_time),
+            AxiChannel.R: self.r_router.route_and_forward(current_time),
+        }
+
+    def clear_accepted_outputs(self) -> Dict[AxiChannel, int]:
+        """
+        Phase 4: Clear accepted outputs for all 5 channel routers.
+
+        Returns:
+            Dict mapping channel to cleared count.
+        """
+        return {
+            AxiChannel.AW: self.aw_router.clear_accepted_outputs(),
+            AxiChannel.W: self.w_router.clear_accepted_outputs(),
+            AxiChannel.AR: self.ar_router.clear_accepted_outputs(),
+            AxiChannel.B: self.b_router.clear_accepted_outputs(),
+            AxiChannel.R: self.r_router.clear_accepted_outputs(),
+        }
+
+    def clear_all_input_signals(self) -> None:
+        """Clear input signals on all 5 channel routers."""
+        self.aw_router.clear_all_input_signals()
+        self.w_router.clear_all_input_signals()
+        self.ar_router.clear_all_input_signals()
+        self.b_router.clear_all_input_signals()
+        self.r_router.clear_all_input_signals()
+
+    # =========================================================================
+    # Statistics
+    # =========================================================================
+
+    def get_total_flits_forwarded(self) -> int:
+        """Get total flits forwarded across all channels."""
+        return sum(
+            router.stats.flits_forwarded
+            for router in self._channel_routers.values()
+        )
+
+    def get_channel_stats(self) -> Dict[AxiChannel, RouterStats]:
+        """Get statistics per channel."""
+        return {
+            channel: router.stats
+            for channel, router in self._channel_routers.items()
+        }
+
+    def __repr__(self) -> str:
+        return f"AXIModeRouter{self.coord}"
+
+
+class AXIModeEdgeRouter(AXIModeRouter):
+    """
+    Edge Router for AXI Mode at Column 0.
+
+    Similar to EdgeRouter but with 5 Sub-Routers instead of 2.
+    Connects to RoutingSelector via LOCAL ports.
+    """
+
+    def __init__(
+        self,
+        coord: Tuple[int, int],
+        config: Optional[RouterConfig] = None
+    ):
+        super().__init__(coord, config)
+        self.selector_connected = False
+
+    def connect_to_selector(
+        self,
+        aw_port: "RouterPort",
+        w_port: "RouterPort",
+        ar_port: "RouterPort",
+        b_port: "RouterPort",
+        r_port: "RouterPort"
+    ) -> None:
+        """
+        Connect LOCAL ports to Selector for all 5 channels.
+
+        Args:
+            aw_port: Selector's AW port for this edge router.
+            w_port: Selector's W port for this edge router.
+            ar_port: Selector's AR port for this edge router.
+            b_port: Selector's B port for this edge router.
+            r_port: Selector's R port for this edge router.
+        """
+        self.aw_router.connect(Direction.LOCAL, aw_port)
+        self.w_router.connect(Direction.LOCAL, w_port)
+        self.ar_router.connect(Direction.LOCAL, ar_port)
+        self.b_router.connect(Direction.LOCAL, b_port)
+        self.r_router.connect(Direction.LOCAL, r_port)
+        self.selector_connected = True
+
+    def clear_accepted_outputs(self) -> Dict[AxiChannel, int]:
+        """
+        Phase 4: Clear accepted outputs, skipping LOCAL ports.
+
+        EdgeRouter-specific: LOCAL port outputs are cleared by Selector's
+        wire propagation, not during this phase.
+        """
+        result = {}
+
+        for channel, router in self._channel_routers.items():
+            cleared = 0
+            for direction, port in router.ports.items():
+                if direction == Direction.LOCAL:
+                    # Skip LOCAL - managed by Selector's wire cycle
+                    continue
+                if port.clear_output_if_accepted():
+                    cleared += 1
+            result[channel] = cleared
+
+        return result
+
+    def __repr__(self) -> str:
+        sel = "↔Sel" if self.selector_connected else ""
+        return f"AXIModeEdgeRouter{self.coord}{sel}"

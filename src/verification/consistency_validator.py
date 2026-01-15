@@ -3,6 +3,11 @@ Consistency-based Performance Validator.
 
 Validates that performance metrics are internally consistent using
 Monitor-based approach (no core modification required).
+
+For line-rate injection model:
+- λ (arrival rate) in Little's Law is the measured throughput, not a configured
+  injection_rate as in BookSim2. This is because our model injects at line-rate
+  (as fast as backpressure allows).
 """
 
 from typing import Dict, Tuple, Optional
@@ -35,7 +40,7 @@ class ConsistencyValidator:
         throughput: float,
         avg_latency: float,
         avg_occupancy: float,
-        flit_width_bytes: int = 8
+        flit_width_bytes: int = 32
     ) -> Tuple[bool, str]:
         """
         Validate Little's Law: L = λ × W
@@ -45,16 +50,20 @@ class ConsistencyValidator:
         - λ: Arrival rate (flits/cycle)
         - W: Average time in system (latency in cycles)
 
-        For NoC:
+        For NoC (line-rate injection model):
         - L = avg_occupancy (flits in network)
         - λ = throughput (bytes/cycle) / flit_width (flits/cycle)
         - W = avg_latency (cycles)
+
+        Note: In BookSim2, λ is a configured injection_rate.
+        In our model, λ is the measured throughput since we inject
+        at line-rate (as fast as backpressure allows).
 
         Args:
             throughput: Measured throughput in bytes/cycle
             avg_latency: Average latency in cycles
             avg_occupancy: Average number of flits in network
-            flit_width_bytes: Flit width in bytes (default 8)
+            flit_width_bytes: Flit width in bytes (default 32 for FlooNoC)
 
         Returns:
             Tuple of (is_valid, error_message)

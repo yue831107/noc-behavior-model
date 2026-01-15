@@ -23,24 +23,110 @@ sys.path.insert(0, str(project_root))
 
 from src.core import V1System, HostMemory, Memory
 from src.config import load_transfer_config, load_transfer_configs, TransferConfig, TransferMode
+from src.metrics import BookSimMetrics, SaturationStatus
 
 
-def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
+def calculate_host_zero_load_latency(
+    target_nodes: List[int],
+    mesh_cols: int = 5,
+    mesh_rows: int = 4
+) -> float:
     """
-    Validate performance metrics against theoretical bounds and consistency.
+    Calculate average zero-load latency (L0) for Host-to-NoC transfers.
 
-    Uses validators from tests/performance to check:
-    - TheoryValidator: Throughput <= max, Buffer utilization in [0,1]
-    - ConsistencyValidator: Little's Law, Flit Conservation
+    For Host-to-NoC, packets enter via edge routers (column 0) and
+    route to compute nodes (columns 1-4). This calculates the average
+    Manhattan distance + overhead.
+
+    Args:
+        target_nodes: List of target node IDs (0-15 for 4x4 compute mesh)
+        mesh_cols: Total mesh columns (default 5, with col 0 as edge)
+        mesh_rows: Mesh rows (default 4)
+
+    Returns:
+        Average zero-load latency in cycles
+    """
+    from src.verification import TheoryValidator
+    from src.verification.theory_validator import MeshConfig
+
+    mesh_config = MeshConfig(cols=mesh_cols, rows=mesh_rows, edge_column=0)
+    validator = TheoryValidator(mesh_config=mesh_config)
+
+    # Edge routers are in column 0, rows 0-3
+    # Compute nodes are in columns 1-4, rows 0-3
+    # node_id = row * (cols-1) + (col-1) for col > 0
+    compute_cols = mesh_cols - 1  # 4 compute columns
+
+    total_latency = 0.0
+    for node_id in target_nodes:
+        # Convert node_id to mesh coordinate
+        node_col = (node_id % compute_cols) + 1  # +1 because col 0 is edge
+        node_row = node_id // compute_cols
+
+        # Find nearest edge router (same row, column 0)
+        edge_coord = (0, node_row)
+        node_coord = (node_col, node_row)
+
+        # Calculate zero-load latency
+        l0 = validator.calculate_zero_load_latency(edge_coord, node_coord)
+        total_latency += l0
+
+    return total_latency / len(target_nodes) if target_nodes else 0.0
+
+
+def print_booksim_metrics(
+    metrics: BookSimMetrics,
+    title: str = "Performance Metrics (BookSim2-Style)"
+) -> None:
+    """
+    Print BookSim2-style performance metrics summary.
+
+    Args:
+        metrics: BookSimMetrics dataclass
+        title: Header title
+    """
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+    print(f"Throughput:          {metrics.throughput:.4f} flits/cycle")
+    print(f"Total Flits:         {metrics.total_packets}")
+    print(f"Total Cycles:        {metrics.total_cycles}")
+    print("-" * 70)
+    print(f"Average Latency:     {metrics.avg_latency:.1f} cycles")
+    print(f"Min Latency:         {metrics.min_latency:.1f} cycles")
+    print(f"Max Latency:         {metrics.max_latency:.1f} cycles")
+    print("-" * 70)
+    print(f"Zero-Load Latency:   {metrics.zero_load_latency:.1f} cycles (L0)")
+    print(f"Normalized Latency:  {metrics.saturation_factor:.2f} (L/L0)")
+    print(f"Saturation Status:   {metrics.saturation_status.value.upper()}")
+    if metrics.is_saturated:
+        print("  WARNING: Network is SATURATED (L > 3*L0)")
+    print("=" * 70)
+
+
+def validate_performance_metrics(
+    metrics: dict,
+    zero_load_latency: float = None,
+    verbose: bool = True
+) -> bool:
+    """
+    Validate performance metrics using BookSim2-style checks.
+
+    Validations:
+    - Latency: L >= L0 (zero-load), saturation detection (L > 3*L0)
+    - Buffer utilization: [0, 1] range
+    - Little's Law: L = lambda * W
+    - Flit Conservation: Sent = Received
 
     Args:
         metrics: Dict with performance metrics:
-            - throughput: bytes/cycle
+            - avg_latency: cycles
             - buffer_utilization: ratio [0, 1]
-            - avg_latency: cycles (for Little's Law)
+            - throughput: bytes/cycle (for Little's Law)
             - avg_occupancy: flits in network (for Little's Law)
             - total_flits_sent: flits injected (for Flit Conservation)
             - total_flits_received: flits ejected (for Flit Conservation)
+        zero_load_latency: Theoretical minimum latency (L0). If None, skip latency validation.
         verbose: Print validation results
 
     Returns:
@@ -49,21 +135,30 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
     all_passed = True
     results = []
 
-    # === Theory Validation ===
+    # === Theory Validation (BookSim2-Style) ===
     try:
         from src.verification import TheoryValidator
         theory_validator = TheoryValidator()
 
-        # 1. Throughput validation
-        if 'throughput' in metrics:
-            is_valid, msg = theory_validator.validate_throughput(metrics['throughput'])
-            results.append(('Throughput', is_valid, msg))
-            if not is_valid:
-                all_passed = False
+        # 1. Latency validation with saturation detection
+        # Skip if no latency samples (avg_latency == 0)
+        if 'avg_latency' in metrics and zero_load_latency is not None:
+            if metrics['avg_latency'] > 0:
+                is_valid, msg, details = theory_validator.validate_latency(
+                    avg_latency=metrics['avg_latency'],
+                    zero_load_latency=zero_load_latency
+                )
+                results.append(('Latency', is_valid, msg))
+                if not is_valid:
+                    all_passed = False
+            else:
+                results.append(('Latency', True, "OK (no samples - skipped)"))
 
         # 2. Buffer utilization validation
         if 'buffer_utilization' in metrics and metrics['buffer_utilization'] is not None:
-            is_valid, msg = theory_validator.validate_buffer_utilization(metrics['buffer_utilization'])
+            is_valid, msg = theory_validator.validate_buffer_utilization(
+                metrics['buffer_utilization']
+            )
             results.append(('Buffer Util', is_valid, msg))
             if not is_valid:
                 all_passed = False
@@ -78,7 +173,7 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
         from src.verification import ConsistencyValidator
         consistency_validator = ConsistencyValidator(tolerance=0.50)  # 50% tolerance for NoC
 
-        # 3. Little's Law: L = λ × W
+        # 3. Little's Law: L = lambda * W
         # Skip if avg_occupancy is very low (< 0.1 flits) - buffer snapshots miss transient states
         if all(k in metrics for k in ['throughput', 'avg_latency', 'avg_occupancy']):
             if metrics['avg_occupancy'] >= 0.1:  # Only validate if meaningful occupancy
@@ -86,7 +181,7 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
                     throughput=metrics['throughput'],
                     avg_latency=metrics['avg_latency'],
                     avg_occupancy=metrics['avg_occupancy'],
-                    flit_width_bytes=8
+                    flit_width_bytes=32  # FlooNoC flit width
                 )
                 results.append(("Little's Law", is_valid, msg))
                 if not is_valid:
@@ -109,7 +204,7 @@ def validate_performance_metrics(metrics: dict, verbose: bool = True) -> bool:
 
     # Print results
     if verbose and results:
-        print("\n--- Performance Validation ---")
+        print("\n--- Performance Validation (BookSim2-Style) ---")
         for name, is_valid, msg in results:
             status = "PASS" if is_valid else "FAIL"
             print(f"  {name + ':':<17} {status}")
@@ -266,6 +361,14 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
     from src.visualization import MetricsCollector
     collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
+    # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
+
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
     offset = config.src_addr % len(bin_data)
@@ -340,30 +443,30 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
         else:
             print(f"FAIL: {fail_count} verification failures")
 
-    # === Performance Validation (using MetricsCollector) ===
-    throughput = collector.get_throughput()
-    latency_stats = collector.get_latency_stats()
+    # === Performance Metrics (BookSim2-Style) ===
+    # Calculate zero-load latency for these target nodes
+    zero_load_latency = calculate_host_zero_load_latency(target_nodes)
+    collector.set_zero_load_latency(zero_load_latency)
+
+    # Get BookSim2-style metrics
+    booksim_metrics = collector.get_booksim_metrics()
+
+    if verbose:
+        print_booksim_metrics(booksim_metrics)
+
+    # Prepare metrics for validation
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
-
-    avg_latency = latency_stats['avg']
-    avg_buffer_util = buffer_stats['avg']
-    buffer_util_ratio = buffer_stats['utilization']
-
-    if verbose and latency_stats['samples'] > 0:
-        print(f"\n--- Latency Distribution ---")
-        print(f"  Samples:      {latency_stats['samples']}")
-        print(f"  Min Latency:  {latency_stats['min']} cycles")
-        print(f"  Max Latency:  {latency_stats['max']} cycles")
-        print(f"  Avg Latency:  {latency_stats['avg']:.2f} cycles")
-        print(f"  Std Dev:      {latency_stats['std']:.2f} cycles")
-
     perf_metrics = {
-        'throughput': throughput,
-        'buffer_utilization': buffer_util_ratio,
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
+        'throughput': booksim_metrics.throughput * 32,  # Convert packets/cycle to bytes/cycle
+        'buffer_utilization': buffer_stats['utilization'],
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
     success = success and validation_passed
 
     # Save metrics
@@ -417,6 +520,14 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
     from src.visualization import MetricsCollector
     collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
 
+    # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
+
     # Load test data from BIN file
     offset = config.read_src_addr % len(bin_data)
     size = config.effective_read_size
@@ -441,6 +552,7 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
     cycle = 0
     while write_completed < len(target_nodes) and cycle < 5000:
         system.process_cycle()
+        collector.capture()
         while True:
             resp = system.master_ni.get_b_response()
             if resp is None:
@@ -462,6 +574,7 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
     outstanding = {}
     completed = 0
     read_data = {}
+    read_buffers = {}  # Accumulate beats per rid
 
     for node_id in target_nodes:
         if len(outstanding) >= config.max_outstanding:
@@ -469,6 +582,7 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
         addr = (node_id << 32) | config.read_src_addr
         system.submit_read(addr, config.effective_read_size, read_axi_id)
         outstanding[read_axi_id] = node_id
+        read_buffers[read_axi_id] = b''  # Initialize buffer for this read
         read_axi_id += 1
 
     pending_nodes = [n for n in target_nodes if n not in outstanding.values()]
@@ -482,18 +596,25 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
             resp = system.master_ni.get_r_response()
             if resp is None:
                 break
-            if resp.rlast and resp.rid in outstanding:
-                node_id = outstanding[resp.rid]
-                read_data[node_id] = resp.rdata
-                del outstanding[resp.rid]
-                completed += 1
+            if resp.rid in outstanding:
+                # Accumulate beat data
+                read_buffers[resp.rid] += resp.rdata
 
-                if pending_nodes and len(outstanding) < config.max_outstanding:
-                    node_id = pending_nodes.pop(0)
-                    addr = (node_id << 32) | config.read_src_addr
-                    system.submit_read(addr, config.effective_read_size, read_axi_id)
-                    outstanding[read_axi_id] = node_id
-                    read_axi_id += 1
+                if resp.rlast:
+                    # Transfer complete - move accumulated data to read_data
+                    node_id = outstanding[resp.rid]
+                    read_data[node_id] = read_buffers[resp.rid]
+                    del outstanding[resp.rid]
+                    del read_buffers[resp.rid]
+                    completed += 1
+
+                    if pending_nodes and len(outstanding) < config.max_outstanding:
+                        node_id = pending_nodes.pop(0)
+                        addr = (node_id << 32) | config.read_src_addr
+                        system.submit_read(addr, config.effective_read_size, read_axi_id)
+                        outstanding[read_axi_id] = node_id
+                        read_buffers[read_axi_id] = b''
+                        read_axi_id += 1
 
         cycle += 1
 
@@ -517,24 +638,27 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
         else:
             print(f"FAIL: {fail_count} verification failures")
 
-    # === Performance Validation ===
-    throughput = config.effective_read_size / cycle if cycle > 0 else 0
-    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
-    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
-    total_buffer_capacity = 20 * 4 * 5  # 20 routers, 4 depth, 5 ports
-    buffer_util_ratio = avg_buffer_util / total_buffer_capacity if total_buffer_capacity > 0 else 0
+    # === Performance Metrics (BookSim2-Style) ===
+    zero_load_latency = calculate_host_zero_load_latency(target_nodes)
+    collector.set_zero_load_latency(zero_load_latency)
 
-    # Latency from collector
-    latencies = collector.get_all_latencies()
-    avg_latency = sum(latencies) / len(latencies) if latencies else cycle / len(target_nodes)
+    booksim_metrics = collector.get_booksim_metrics()
 
+    if verbose:
+        print_booksim_metrics(booksim_metrics)
+
+    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': throughput,
-        'buffer_utilization': buffer_util_ratio,
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
+        'throughput': booksim_metrics.throughput * 32,
+        'buffer_utilization': buffer_stats['utilization'],
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
     success = success and validation_passed
 
     # Save metrics
@@ -588,6 +712,14 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
     from src.visualization import MetricsCollector
     collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
+    # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
+
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
     offset = config.src_addr % len(bin_data)
@@ -633,6 +765,7 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
     # Run simulation
     while completed < len(target_nodes) and cycle < max_cycles:
         system.process_cycle()
+        collector.capture()
 
         while True:
             resp = system.master_ni.get_b_response()
@@ -676,24 +809,27 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
         else:
             print(f"FAIL: {fail_count} golden mismatches")
 
-    # === Performance Validation ===
-    throughput = config.src_size / cycle if cycle > 0 else 0
-    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
-    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
-    total_buffer_capacity = 20 * 4 * 5  # 20 routers, 4 depth, 5 ports
-    buffer_util_ratio = avg_buffer_util / total_buffer_capacity if total_buffer_capacity > 0 else 0
+    # === Performance Metrics (BookSim2-Style) ===
+    zero_load_latency = calculate_host_zero_load_latency(target_nodes)
+    collector.set_zero_load_latency(zero_load_latency)
 
-    # Latency from collector
-    latencies = collector.get_all_latencies()
-    avg_latency = sum(latencies) / len(latencies) if latencies else cycle / len(target_nodes)
+    booksim_metrics = collector.get_booksim_metrics()
 
+    if verbose:
+        print_booksim_metrics(booksim_metrics)
+
+    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': throughput,
-        'buffer_utilization': buffer_util_ratio,
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
+        'throughput': booksim_metrics.throughput * 32,
+        'buffer_utilization': buffer_stats['utilization'],
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
     success = success and validation_passed
 
     # Save metrics
@@ -746,6 +882,14 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
     system = V1System(mesh_cols=5, mesh_rows=4)
     from src.visualization import MetricsCollector
     collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
+
+    # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
 
     target_nodes = config.get_target_node_list(total_nodes=16)
     total_size = config.effective_read_size
@@ -812,6 +956,7 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
     outstanding = {}
     completed = 0
     read_data = {}  # node_id -> data (for ordering)
+    read_buffers = {}  # Accumulate beats per rid
 
     for node_id in target_nodes:
         if len(outstanding) >= config.max_outstanding:
@@ -819,6 +964,7 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
         addr = (node_id << 32) | config.read_src_addr
         system.submit_read(addr, portion_size, read_axi_id)
         outstanding[read_axi_id] = node_id
+        read_buffers[read_axi_id] = b''
         read_axi_id += 1
 
     pending_nodes = [n for n in target_nodes if n not in outstanding.values()]
@@ -831,18 +977,25 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
             resp = system.master_ni.get_r_response()
             if resp is None:
                 break
-            if resp.rlast and resp.rid in outstanding:
-                node_id = outstanding[resp.rid]
-                read_data[node_id] = resp.rdata
-                del outstanding[resp.rid]
-                completed += 1
+            if resp.rid in outstanding:
+                # Accumulate beat data
+                read_buffers[resp.rid] += resp.rdata
 
-                if pending_nodes and len(outstanding) < config.max_outstanding:
-                    node_id = pending_nodes.pop(0)
-                    addr = (node_id << 32) | config.read_src_addr
-                    system.submit_read(addr, portion_size, read_axi_id)
-                    outstanding[read_axi_id] = node_id
-                    read_axi_id += 1
+                if resp.rlast:
+                    # Transfer complete - move accumulated data to read_data
+                    node_id = outstanding[resp.rid]
+                    read_data[node_id] = read_buffers[resp.rid]
+                    del outstanding[resp.rid]
+                    del read_buffers[resp.rid]
+                    completed += 1
+
+                    if pending_nodes and len(outstanding) < config.max_outstanding:
+                        node_id = pending_nodes.pop(0)
+                        addr = (node_id << 32) | config.read_src_addr
+                        system.submit_read(addr, portion_size, read_axi_id)
+                        outstanding[read_axi_id] = node_id
+                        read_buffers[read_axi_id] = b''
+                        read_axi_id += 1
 
         cycle += 1
 
@@ -877,24 +1030,27 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
                     print(f"  First mismatch at offset {i}: expected 0x{expected_golden[i]:02X}, got 0x{gathered_result[i]:02X}")
                     break
 
-    # === Performance Validation ===
-    throughput = config.effective_read_size / cycle if cycle > 0 else 0
-    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
-    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
-    total_buffer_capacity = 20 * 4 * 5  # 20 routers, 4 depth, 5 ports
-    buffer_util_ratio = avg_buffer_util / total_buffer_capacity if total_buffer_capacity > 0 else 0
+    # === Performance Metrics (BookSim2-Style) ===
+    zero_load_latency = calculate_host_zero_load_latency(target_nodes)
+    collector.set_zero_load_latency(zero_load_latency)
 
-    # Latency from collector
-    latencies = collector.get_all_latencies()
-    avg_latency = sum(latencies) / len(latencies) if latencies else cycle / len(target_nodes)
+    booksim_metrics = collector.get_booksim_metrics()
 
+    if verbose:
+        print_booksim_metrics(booksim_metrics)
+
+    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': throughput,
-        'buffer_utilization': buffer_util_ratio,
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
+        'throughput': booksim_metrics.throughput * 32,
+        'buffer_utilization': buffer_stats['utilization'],
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
     success = success and validation_passed
 
     # Save metrics
@@ -920,6 +1076,7 @@ def run_multi_transfer(
     buffer_depth: int = 32,
     mesh_cols: int = 5,
     mesh_rows: int = 4,
+    channel_mode: str = 'general',
 ) -> dict:
     """
     Run multi-transfer queue test with per-transfer verification.
@@ -967,14 +1124,22 @@ def run_multi_transfer(
     
     # Per-transfer verification results
     verify_results: List[dict] = []  # [{idx, pass, fail, details}]
-    
+
     # Track expected data for current transfer
     current_expected: dict = {}  # (node_id, addr) -> expected_bytes
-    
+
+    # Track transfer start cycles for latency calculation
+    transfer_start_cycles: dict = {}  # idx -> start_cycle
+    current_cycle_ref = [0]  # Mutable reference for closure
+
     def on_transfer_start(idx: int, config: TransferConfig) -> None:
         """Initialize memory before each transfer."""
         nonlocal current_expected
         current_expected.clear()
+
+        # Record start cycle for transfer progress tracking (not latency)
+        transfer_start_cycles[idx] = current_cycle_ref[0]
+        # Note: Flit-level latency tracking is done via NI callbacks below
         
         # Load data from BIN file (cycle through if needed)
         offset = config.src_addr % len(bin_data)
@@ -1021,7 +1186,9 @@ def run_multi_transfer(
     def on_transfer_complete(idx: int, config: TransferConfig) -> None:
         """Verify data immediately after each transfer completes."""
         nonlocal verify_results
-        
+
+        # Note: Flit-level latency tracking is done via NI callbacks
+
         pass_count = 0
         fail_count = 0
         details = []
@@ -1106,16 +1273,29 @@ def run_multi_transfer(
             print(f"  [Transfer {idx+1}] FAIL: {fail_count} mismatches")
 
     # Create V1System and collector
+    from src.core.router import ChannelMode
+    ch_mode = ChannelMode.AXI if channel_mode == 'axi' else ChannelMode.GENERAL
     system = V1System(
         mesh_cols=mesh_cols,
         mesh_rows=mesh_rows,
         buffer_depth=buffer_depth,
         host_memory=host_memory,
+        channel_mode=ch_mode,
     )
     from src.visualization import MetricsCollector
     # Approximate capture interval based on avg transfer size
     avg_size = sum(c.src_size for c in configs) // len(configs) if configs else 1024
     collector = MetricsCollector(system, capture_interval=max(1, avg_size // 512))
+
+    # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
+    # Each flit carries its injection_cycle, MasterNI calculates latency on arrival
+    def on_flit_latency(latency: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency)
+
+    # Connect all MasterNI (mesh nodes) flit latency callbacks
+    for coord, master_ni in system.mesh.nis.items():
+        master_ni.set_flit_latency_callback(on_flit_latency)
 
     # Create HostAXIMaster with both callbacks
     first_config = configs[0]
@@ -1160,7 +1340,8 @@ def run_multi_transfer(
         system.process_cycle()
         collector.capture()
         cycle += 1
-        
+        current_cycle_ref[0] = cycle  # Update for callbacks
+
         if verbose and cycle % 1000 == 0:
             progress = system.host_axi_master.queue_progress
             if progress != last_progress:
@@ -1210,88 +1391,46 @@ def run_multi_transfer(
             if total_fail > 10:
                 print(f"  ... and more failures")
         
-    # === Collect Performance Metrics ===
-    total_bytes = sum(c.src_size for c in configs)
-    throughput = total_bytes / cycle if cycle > 0 else 0
+    # === Performance Metrics (BookSim2-Style) ===
+    # Collect all target nodes across all configs for L0 calculation
+    all_target_nodes = set()
+    for config in configs:
+        nodes = config.get_target_node_list(total_nodes=16)
+        all_target_nodes.update(nodes)
+    all_target_nodes = list(all_target_nodes)
 
-    # Router flit statistics
-    flit_stats = system.get_flit_stats()
-    total_flits = sum(flit_stats.values())
-    active_routers = sum(1 for v in flit_stats.values() if v > 0)
-    avg_flits_per_router = total_flits / len(flit_stats) if flit_stats else 0
-    max_flits_router = max(flit_stats.values()) if flit_stats else 0
+    zero_load_latency = calculate_host_zero_load_latency(
+        all_target_nodes, mesh_cols=mesh_cols, mesh_rows=mesh_rows
+    )
+    collector.set_zero_load_latency(zero_load_latency)
 
-    # Buffer utilization from collector
-    buffer_occupancies = [s.flits_in_flight for s in collector.snapshots]
-    peak_buffer_util = max(buffer_occupancies) if buffer_occupancies else 0
-    avg_buffer_util = sum(buffer_occupancies) / len(buffer_occupancies) if buffer_occupancies else 0
-    # Average during active periods (when flits are in flight)
-    active_occupancies = [x for x in buffer_occupancies if x > 0]
-    active_avg_buffer = sum(active_occupancies) / len(active_occupancies) if active_occupancies else 0
-    active_pct = len(active_occupancies) / len(buffer_occupancies) * 100 if buffer_occupancies else 0
-
-    # Latency statistics from collector
-    latencies = collector.get_all_latencies()
-    if latencies:
-        import statistics
-        min_latency = min(latencies)
-        max_latency = max(latencies)
-        avg_latency = statistics.mean(latencies)
-        std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0
-    else:
-        min_latency = max_latency = std_latency = 0
-        avg_latency = cycle / total if total > 0 else 0
+    booksim_metrics = collector.get_booksim_metrics()
 
     if verbose:
-        print("\n--- Performance Metrics ---")
-        print(f"  Total Cycles:      {cycle}")
-        print(f"  Total Data:        {total_bytes} bytes")
-        print(f"  Throughput:        {throughput:.2f} bytes/cycle")
+        print_booksim_metrics(booksim_metrics)
 
+        # Additional router statistics
+        flit_stats = system.get_flit_stats()
+        total_flits = sum(flit_stats.values())
+        active_routers = sum(1 for v in flit_stats.values() if v > 0)
         print("\n--- Router Statistics ---")
         print(f"  Total Flits:       {total_flits}")
         print(f"  Active Routers:    {active_routers}/{len(flit_stats)}")
-        print(f"  Avg Flits/Router:  {avg_flits_per_router:.1f}")
-        print(f"  Max Flits (router):{max_flits_router}")
-
-        print("\n--- Latency Distribution ---")
-        if latencies:
-            print(f"  Samples:           {len(latencies)}")
-            print(f"  Min Latency:       {min_latency} cycles")
-            print(f"  Max Latency:       {max_latency} cycles")
-            print(f"  Avg Latency:       {avg_latency:.2f} cycles")
-            print(f"  Std Dev:           {std_latency:.2f} cycles")
-        else:
-            print(f"  Avg Latency:       {avg_latency:.2f} cycles (estimated)")
-
-        print("\n--- Buffer Utilization ---")
-        print(f"  Peak Occupancy:    {peak_buffer_util} flits")
-        print(f"  Avg Occupancy:     {avg_buffer_util:.3f} flits")
-        print(f"  Active Avg:        {active_avg_buffer:.2f} flits ({active_pct:.1f}% of cycles active)")
 
     # === Performance Validation ===
-    # Calculate buffer utilization ratio (0-1)
-    # Assume total buffer capacity = num_routers * buffer_depth * num_ports
-    total_buffer_capacity = 20 * 4 * 5  # 20 routers, 4 depth, 5 ports
-    buffer_util_ratio = avg_buffer_util / total_buffer_capacity if total_buffer_capacity > 0 else 0
-
-    # Note: Flit conservation check is skipped for Host-to-NoC because:
-    # - Request path flits (writes) and Response path flits (acks) are different counts
-    # - Need end-to-end tracking for meaningful comparison
-    #
-    # Little's Law check may have high deviation when:
-    # - Buffer occupancy is very low (flits processed quickly)
-    # - Snapshot interval misses transient buffer states
-
+    buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
         'total_cycles': cycle,
-        'throughput': throughput,
-        'buffer_utilization': buffer_util_ratio,
-        'avg_latency': avg_latency,
-        'avg_occupancy': avg_buffer_util,
-        # Flit conservation omitted - request vs response flits are different flows
+        'throughput': booksim_metrics.throughput * 32,
+        'buffer_utilization': buffer_stats['utilization'],
+        'avg_latency': booksim_metrics.avg_latency,
+        'avg_occupancy': buffer_stats['avg'],
     }
-    validation_passed = validate_performance_metrics(perf_metrics, verbose=verbose)
+    validation_passed = validate_performance_metrics(
+        perf_metrics,
+        zero_load_latency=zero_load_latency,
+        verbose=verbose
+    )
 
     # Include validation in overall success
     overall_success = overall_success and validation_passed
@@ -1341,6 +1480,8 @@ def main():
                         help='Mesh rows (default: 4)')
     parser.add_argument('--json-output', type=str, default=None,
                         help='Output metrics to JSON file')
+    parser.add_argument('--mode', type=str, choices=['general', 'axi'], default='general',
+                        help='Channel mode: general (2 Sub-Routers) or axi (5 Sub-Routers)')
 
     args = parser.parse_args()
 
@@ -1368,6 +1509,7 @@ def main():
             buffer_depth=args.buffer_depth,
             mesh_cols=args.mesh_cols,
             mesh_rows=args.mesh_rows,
+            channel_mode=args.mode,
         )
 
         # Output JSON if requested
