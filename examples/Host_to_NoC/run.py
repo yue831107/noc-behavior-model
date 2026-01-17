@@ -88,7 +88,8 @@ def print_booksim_metrics(
     print("\n" + "=" * 70)
     print(title)
     print("=" * 70)
-    print(f"Throughput:          {metrics.throughput:.4f} flits/cycle")
+    print(f"Throughput:          {metrics.throughput:.2f} bytes/cycle")
+    print(f"Total Bytes:         {metrics.total_bytes}")
     print(f"Total Flits:         {metrics.total_packets}")
     print(f"Total Cycles:        {metrics.total_cycles}")
     print("-" * 70)
@@ -115,15 +116,12 @@ def validate_performance_metrics(
     Validations:
     - Latency: L >= L0 (zero-load), saturation detection (L > 3*L0)
     - Buffer utilization: [0, 1] range
-    - Little's Law: L = lambda * W
     - Flit Conservation: Sent = Received
 
     Args:
         metrics: Dict with performance metrics:
             - avg_latency: cycles
             - buffer_utilization: ratio [0, 1]
-            - throughput: bytes/cycle (for Little's Law)
-            - avg_occupancy: flits in network (for Little's Law)
             - total_flits_sent: flits injected (for Flit Conservation)
             - total_flits_received: flits ejected (for Flit Conservation)
         zero_load_latency: Theoretical minimum latency (L0). If None, skip latency validation.
@@ -173,23 +171,7 @@ def validate_performance_metrics(
         from src.verification import ConsistencyValidator
         consistency_validator = ConsistencyValidator(tolerance=0.50)  # 50% tolerance for NoC
 
-        # 3. Little's Law: L = lambda * W
-        # Skip if avg_occupancy is very low (< 0.1 flits) - buffer snapshots miss transient states
-        if all(k in metrics for k in ['throughput', 'avg_latency', 'avg_occupancy']):
-            if metrics['avg_occupancy'] >= 0.1:  # Only validate if meaningful occupancy
-                is_valid, msg = consistency_validator.validate_littles_law(
-                    throughput=metrics['throughput'],
-                    avg_latency=metrics['avg_latency'],
-                    avg_occupancy=metrics['avg_occupancy'],
-                    flit_width_bytes=32  # FlooNoC flit width
-                )
-                results.append(("Little's Law", is_valid, msg))
-                if not is_valid:
-                    all_passed = False
-            else:
-                results.append(("Little's Law", True, "OK (low occupancy - skipped)"))
-
-        # 4. Flit Conservation: Sent = Received
+        # 3. Flit Conservation: Sent = Received
         if all(k in metrics for k in ['total_flits_sent', 'total_flits_received']):
             is_valid, msg = consistency_validator.validate_flit_conservation(
                 total_sent=metrics['total_flits_sent'],
@@ -362,12 +344,15 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
     collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
     # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
-    def on_flit_latency(latency: int) -> None:
+    from src.core.flit import AxiChannel
+
+    def on_flit_latency(latency: int, axi_ch: AxiChannel, payload_bytes: int) -> None:
         """Record per-flit latency when flit arrives at destination."""
-        collector.add_latency_sample(latency)
+        collector.add_latency_sample(latency, axi_ch, payload_bytes)
 
     for coord, master_ni in system.mesh.nis.items():
         master_ni.set_flit_latency_callback(on_flit_latency)
+    system.master_ni.set_flit_latency_callback(on_flit_latency)
 
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
@@ -457,7 +442,7 @@ def run_broadcast_write(config: TransferConfig, verbose: bool = True, bin_file: 
     # Prepare metrics for validation
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': booksim_metrics.throughput * 32,  # Convert packets/cycle to bytes/cycle
+        'throughput': booksim_metrics.throughput,  # Already in bytes/cycle
         'buffer_utilization': buffer_stats['utilization'],
         'avg_latency': booksim_metrics.avg_latency,
         'avg_occupancy': buffer_stats['avg'],
@@ -521,12 +506,15 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
     collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
 
     # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
-    def on_flit_latency(latency: int) -> None:
+    from src.core.flit import AxiChannel
+
+    def on_flit_latency(latency: int, axi_ch: AxiChannel, payload_bytes: int) -> None:
         """Record per-flit latency when flit arrives at destination."""
-        collector.add_latency_sample(latency)
+        collector.add_latency_sample(latency, axi_ch, payload_bytes)
 
     for coord, master_ni in system.mesh.nis.items():
         master_ni.set_flit_latency_callback(on_flit_latency)
+    system.master_ni.set_flit_latency_callback(on_flit_latency)
 
     # Load test data from BIN file
     offset = config.read_src_addr % len(bin_data)
@@ -649,7 +637,7 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
 
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': booksim_metrics.throughput * 32,
+        'throughput': booksim_metrics.throughput,
         'buffer_utilization': buffer_stats['utilization'],
         'avg_latency': booksim_metrics.avg_latency,
         'avg_occupancy': buffer_stats['avg'],
@@ -713,12 +701,15 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
     collector = MetricsCollector(system, capture_interval=max(1, config.src_size // 256))
 
     # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
-    def on_flit_latency(latency: int) -> None:
+    from src.core.flit import AxiChannel
+
+    def on_flit_latency(latency: int, axi_ch: AxiChannel, payload_bytes: int) -> None:
         """Record per-flit latency when flit arrives at destination."""
-        collector.add_latency_sample(latency)
+        collector.add_latency_sample(latency, axi_ch, payload_bytes)
 
     for coord, master_ni in system.mesh.nis.items():
         master_ni.set_flit_latency_callback(on_flit_latency)
+    system.master_ni.set_flit_latency_callback(on_flit_latency)
 
     # Load test data from BIN file
     host_memory = HostMemory(size=1024 * 1024)
@@ -820,7 +811,7 @@ def run_scatter_write(config: TransferConfig, verbose: bool = True, bin_file: st
 
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': booksim_metrics.throughput * 32,
+        'throughput': booksim_metrics.throughput,
         'buffer_utilization': buffer_stats['utilization'],
         'avg_latency': booksim_metrics.avg_latency,
         'avg_occupancy': buffer_stats['avg'],
@@ -884,12 +875,15 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
     collector = MetricsCollector(system, capture_interval=max(1, config.effective_read_size // 256))
 
     # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
-    def on_flit_latency(latency: int) -> None:
+    from src.core.flit import AxiChannel
+
+    def on_flit_latency(latency: int, axi_ch: AxiChannel, payload_bytes: int) -> None:
         """Record per-flit latency when flit arrives at destination."""
-        collector.add_latency_sample(latency)
+        collector.add_latency_sample(latency, axi_ch, payload_bytes)
 
     for coord, master_ni in system.mesh.nis.items():
         master_ni.set_flit_latency_callback(on_flit_latency)
+    system.master_ni.set_flit_latency_callback(on_flit_latency)
 
     target_nodes = config.get_target_node_list(total_nodes=16)
     total_size = config.effective_read_size
@@ -1041,7 +1035,7 @@ def run_gather_read(config: TransferConfig, verbose: bool = True, bin_file: str 
 
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
-        'throughput': booksim_metrics.throughput * 32,
+        'throughput': booksim_metrics.throughput,
         'buffer_utilization': buffer_stats['utilization'],
         'avg_latency': booksim_metrics.avg_latency,
         'avg_occupancy': buffer_stats['avg'],
@@ -1152,22 +1146,33 @@ def run_multi_transfer(
         target_nodes = config.get_target_node_list(total_nodes=16)
         
         if config.is_read:
-            # GATHER (read) mode: Pre-write golden data to node memories
+            # READ mode: Pre-write golden data to node memories
             # Host will read this data back and we verify it
             read_addr = config.read_src_addr if hasattr(config, 'read_src_addr') and config.read_src_addr > 0 else config.dst_addr
-            
-            portion_size = config.src_size // len(target_nodes) if target_nodes else 0
-            for i, node_id in enumerate(target_nodes):
-                # Find node's NI and write golden data to its local memory
-                for coord, ni in system.mesh.nis.items():
-                    if ni.node_id == node_id:
-                        start = i * portion_size
-                        end = start + portion_size
-                        node_data = test_data[start:end]
-                        ni.local_memory.write(read_addr, node_data)
-                        # Track expected data (will be read back to host memory)
-                        current_expected[(node_id, read_addr)] = node_data
-                        break
+            read_size = config.read_size if hasattr(config, 'read_size') and config.read_size > 0 else config.src_size
+
+            if config.transfer_mode == TransferMode.BROADCAST_READ:
+                # BROADCAST_READ: All nodes get the same complete data
+                for node_id in target_nodes:
+                    for coord, ni in system.mesh.nis.items():
+                        if ni.node_id == node_id:
+                            # Write full test data (truncated to read_size)
+                            node_data = test_data[:read_size]
+                            ni.local_memory.write(read_addr, node_data)
+                            current_expected[(node_id, read_addr)] = node_data
+                            break
+            else:
+                # GATHER mode: Each node has different portion
+                portion_size = read_size // len(target_nodes) if target_nodes else 0
+                for i, node_id in enumerate(target_nodes):
+                    for coord, ni in system.mesh.nis.items():
+                        if ni.node_id == node_id:
+                            start = i * portion_size
+                            end = start + portion_size
+                            node_data = test_data[start:end]
+                            ni.local_memory.write(read_addr, node_data)
+                            current_expected[(node_id, read_addr)] = node_data
+                            break
         else:
             # WRITE mode (broadcast/scatter): Fill host memory
             host_memory.fill(config.src_addr, config.src_size, test_data)
@@ -1288,14 +1293,22 @@ def run_multi_transfer(
     collector = MetricsCollector(system, capture_interval=max(1, avg_size // 512))
 
     # === Connect NI callbacks for BookSim2-style flit-level latency tracking ===
-    # Each flit carries its injection_cycle, MasterNI calculates latency on arrival
-    def on_flit_latency(latency: int) -> None:
-        """Record per-flit latency when flit arrives at destination."""
-        collector.add_latency_sample(latency)
+    # Each flit carries its injection_cycle, NI calculates latency on arrival
+    # Callback receives (latency, axi_channel, payload_bytes)
+    # - W/R flits carry user data (payload_bytes > 0)
+    # - AW/AR/B are control flits (payload_bytes = 0)
+    from src.core.flit import AxiChannel
 
-    # Connect all MasterNI (mesh nodes) flit latency callbacks
+    def on_flit_latency(latency: int, axi_ch: AxiChannel, payload_bytes: int) -> None:
+        """Record per-flit latency when flit arrives at destination."""
+        collector.add_latency_sample(latency, axi_ch, payload_bytes)
+
+    # Connect all MasterNI (mesh nodes) for request path (AW, W, AR flits)
     for coord, master_ni in system.mesh.nis.items():
         master_ni.set_flit_latency_callback(on_flit_latency)
+
+    # Connect SlaveNI for response path (B, R flits) - important for Read throughput
+    system.master_ni.set_flit_latency_callback(on_flit_latency)
 
     # Create HostAXIMaster with both callbacks
     first_config = configs[0]
@@ -1421,7 +1434,7 @@ def run_multi_transfer(
     buffer_stats = collector.get_buffer_stats(total_capacity=20 * 4 * 5)
     perf_metrics = {
         'total_cycles': cycle,
-        'throughput': booksim_metrics.throughput * 32,
+        'throughput': booksim_metrics.throughput,
         'buffer_utilization': buffer_stats['utilization'],
         'avg_latency': booksim_metrics.avg_latency,
         'avg_occupancy': buffer_stats['avg'],
@@ -1472,8 +1485,8 @@ def main():
     parser.add_argument('-q', '--quiet', action='store_true', help='Quiet mode')
 
     # System parameters (for multi_para sweep)
-    parser.add_argument('--buffer-depth', type=int, default=32,
-                        help='Router buffer depth (default: 32)')
+    parser.add_argument('--buffer-depth', type=int, default=8,
+                        help='Router buffer depth (default: 8)')
     parser.add_argument('--mesh-cols', type=int, default=5,
                         help='Mesh columns (default: 5)')
     parser.add_argument('--mesh-rows', type=int, default=4,

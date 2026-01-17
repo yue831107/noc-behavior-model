@@ -21,6 +21,7 @@ from ..metrics.booksim_metrics import (
 if TYPE_CHECKING:
     from ..core.routing_selector import V1System, NoCSystem
     from ..core.mesh import Mesh
+    from ..core.flit import AxiChannel
 
 
 @dataclass
@@ -84,6 +85,10 @@ class MetricsCollector:
 
         # BookSim2-style: zero-load latency reference
         self._zero_load_latency: Optional[float] = None
+
+        # Data bytes tracking (only W/R flits, not AW/AR/B)
+        self._data_bytes_received: int = 0
+        self._data_flits_received: int = 0
 
     def _on_packet_arrived(self, packet_id: int, creation_time: int, arrival_time: int) -> None:
         """
@@ -311,15 +316,27 @@ class MetricsCollector:
             latencies.extend(snapshot.latencies)
         return latencies
     
-    def add_latency_sample(self, latency: int) -> None:
+    def add_latency_sample(
+        self,
+        latency: int,
+        axi_channel: Optional["AxiChannel"] = None,
+        payload_bytes: int = 0
+    ) -> None:
         """
         Add a latency sample to the current/latest snapshot.
 
         Args:
             latency: Transaction latency in cycles.
+            axi_channel: Optional AXI channel type (for filtering).
+            payload_bytes: Data bytes carried by this flit (W/R only).
         """
         if self.snapshots:
             self.snapshots[-1].latencies.append(latency)
+
+        # Track data bytes (only W/R flits carry user data)
+        if payload_bytes > 0:
+            self._data_bytes_received += payload_bytes
+            self._data_flits_received += 1
 
     # =========================================================================
     # Latency Tracking (Monitor-Based)
@@ -558,17 +575,21 @@ class MetricsCollector:
         """
         self._zero_load_latency = latency
 
-    def get_booksim_metrics(self) -> BookSimMetrics:
+    def get_booksim_metrics(self, bytes_per_flit: int = 32) -> BookSimMetrics:
         """
         Get BookSim2-style performance metrics.
 
         Returns a BookSimMetrics dataclass with:
-        - throughput: packets/cycle (measured)
+        - throughput: bytes/cycle (measured, data flits only: W/R)
         - latency statistics
         - saturation detection (L > 3×L₀)
 
         Note: Call set_zero_load_latency() before using this method
         to enable saturation detection.
+
+        Args:
+            bytes_per_flit: Bytes per flit for display (default 32).
+                Only used if no data bytes were tracked.
 
         Returns:
             BookSimMetrics dataclass with all metrics.
@@ -580,10 +601,19 @@ class MetricsCollector:
 
         # Get cycle and packet counts
         total_cycles = self.snapshots[-1].cycle if self.snapshots else 1
-        total_packets = latency_stats.get("samples", 0)
 
-        # Calculate throughput (packets/cycle)
-        throughput = total_packets / total_cycles if total_cycles > 0 else 0.0
+        # Use tracked data bytes (W/R flits only) if available
+        # Otherwise fall back to all flits * bytes_per_flit
+        if self._data_bytes_received > 0:
+            total_bytes = self._data_bytes_received
+            total_packets = self._data_flits_received
+        else:
+            # Fallback for backward compatibility
+            total_packets = latency_stats.get("samples", 0)
+            total_bytes = total_packets * bytes_per_flit
+
+        # Calculate throughput (bytes/cycle)
+        throughput = total_bytes / total_cycles if total_cycles > 0 else 0.0
 
         # Determine zero-load latency
         zero_load = self._zero_load_latency
@@ -605,4 +635,5 @@ class MetricsCollector:
             zero_load_latency=zero_load,
             saturation_factor=saturation_factor,
             saturation_status=saturation_status,
+            bytes_per_flit=bytes_per_flit,
         )

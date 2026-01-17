@@ -221,6 +221,7 @@ class V1System:
                 req_buffer_depth=safe_ingress_depth,
                 resp_buffer_depth=safe_ingress_depth,
                 max_outstanding=max_outstanding,
+                channel_mode=channel_mode,  # Pass channel mode to NI
             ),
             ni_id=0,
         )
@@ -256,7 +257,11 @@ class V1System:
             self.host_axi_master._send_axi_requests(self.current_time)
             self.host_axi_master.stats.total_cycles = self.current_time + 1
 
-        # 1. Master NI: Generate request flits (transfer to selector)
+        # 1. Master NI: Process input FIFOs and generate request flits
+        # First, process AXI input FIFOs to convert requests to flits
+        self.master_ni.req_path.process_cycle(self.current_time)
+
+        # Then transfer flits from output buffers to selector
         while self.master_ni.req_ni.has_pending_output():
             if self.selector.ingress_buffer.is_full():
                 break

@@ -82,6 +82,12 @@ class RoutingSelector:
         # Key: (src_id, dst_id, rob_idx), Value: row
         self._packet_path: Dict[Tuple[int, int, int], int] = {}
 
+        # Active W packet per row: track which row has W flits in-flight
+        # In General mode, only one W packet can use a row at a time to prevent
+        # wormhole deadlock from out-of-order flit arrival at the router
+        # Key: row, Value: packet_key (src_id, dst_id, rob_idx)
+        self._active_w_packet: Dict[int, Tuple[int, int, int]] = {}
+
     def connect_edge_routers(self, edge_routers: List["EdgeRouter"]) -> None:
         """
         Connect to Edge Routers via PortWire.
@@ -411,6 +417,10 @@ class RoutingSelector:
             # Pop and set output for wire propagation
             flit = self.ingress_buffer.pop()
 
+            # Save original packet_key BEFORE modifying src_id
+            # This is critical for correct path cleanup
+            original_packet_key = (flit.hdr.src_id, flit.hdr.dst_id, flit.hdr.rob_idx)
+
             # Update flit source to edge router coord (for response routing)
             flit.hdr.src_id = encode_node_id(edge_port.coord)
 
@@ -423,7 +433,14 @@ class RoutingSelector:
             if success:
                 self.stats.req_flits_injected += 1
                 self.stats.path_selections[best_row] += 1
-                self._clear_packet_path(flit)
+
+                # Track active W packet per row (General mode only)
+                # SET when first W flit is sent, CLEAR happens in _clear_packet_path_by_key
+                if not self._is_axi_mode and flit.hdr.axi_ch == AxiChannel.W:
+                    if flit.is_head():
+                        self._active_w_packet[best_row] = original_packet_key
+
+                self._clear_packet_path_by_key(flit, original_packet_key, best_row)
             else:
                 # Put back to buffer
                 self.ingress_buffer.push(flit)
@@ -482,6 +499,16 @@ class RoutingSelector:
         if packet_key in self._packet_path:
             assigned_row = self._packet_path[packet_key]
             port = self.edge_ports[assigned_row]
+
+            # In General mode, check if row is blocked by another W packet
+            # This applies to W flits that need to wait for their turn
+            is_w_flit = flit.hdr.axi_ch == AxiChannel.W
+            if not self._is_axi_mode and is_w_flit and assigned_row in self._active_w_packet:
+                active_key = self._active_w_packet[assigned_row]
+                if active_key != packet_key:
+                    # Row is busy with another W packet - must wait
+                    return None
+
             # Check if can send (mode-specific)
             if self._is_axi_mode:
                 can_send = self._can_send_axi_request(port, flit)
@@ -509,6 +536,14 @@ class RoutingSelector:
             if not can_send:
                 continue
 
+            # In General mode, check if this row has an active W packet
+            # from a different transaction. If so, skip to prevent wormhole deadlock
+            if not self._is_axi_mode and row in self._active_w_packet:
+                active_key = self._active_w_packet[row]
+                if active_key != packet_key:
+                    # Row is busy with another W packet
+                    continue
+
             # Calculate hop count from this edge router to destination
             hops = self._calculate_hops((0, row), dest)
 
@@ -520,9 +555,13 @@ class RoutingSelector:
                 min_cost = cost
                 best_row = row
 
-        # If found a path and this is a multi-flit packet, remember the path
-        if best_row is not None and not flit.is_single_flit():
-            if flit.is_head():
+        # If found a path, remember it for subsequent flits
+        # For AW (single-flit): store path so W uses same edge router
+        # For multi-flit HEAD: store path for body/tail flits
+        if best_row is not None:
+            is_aw_flit = flit.hdr.axi_ch == AxiChannel.AW
+            is_multi_flit_head = flit.is_head() and not flit.is_single_flit()
+            if is_aw_flit or is_multi_flit_head:
                 self._packet_path[packet_key] = best_row
 
         return best_row
@@ -542,11 +581,32 @@ class RoutingSelector:
             return port.ar_credits
         return 0
 
-    def _clear_packet_path(self, flit: Flit) -> None:
-        """Clear packet path after successful TAIL send."""
-        packet_key = (flit.hdr.src_id, flit.hdr.dst_id, flit.hdr.rob_idx)
-        if flit.is_tail() and packet_key in self._packet_path:
-            del self._packet_path[packet_key]
+    def _clear_packet_path_by_key(
+        self,
+        flit: Flit,
+        packet_key: Tuple[int, int, int],
+        row: int
+    ) -> None:
+        """Clear packet path using the original packet key.
+
+        This method must be called with the packet_key computed BEFORE
+        flit.hdr.src_id is modified to edge router coord.
+
+        Args:
+            flit: The flit being sent (to check if W TAIL).
+            packet_key: Original (src_id, dst_id, rob_idx) before src_id modification.
+            row: Edge router row that was used for this flit.
+        """
+        # Only clear on W TAIL (not AW, which needs to keep path for W)
+        is_w_tail = flit.hdr.axi_ch == AxiChannel.W and flit.is_tail()
+        if is_w_tail:
+            if packet_key in self._packet_path:
+                del self._packet_path[packet_key]
+
+            # Clear active W packet tracking (General mode only)
+            if not self._is_axi_mode and row in self._active_w_packet:
+                if self._active_w_packet[row] == packet_key:
+                    del self._active_w_packet[row]
 
     def _calculate_hops(
         self,
