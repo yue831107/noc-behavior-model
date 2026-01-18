@@ -553,11 +553,17 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
 
     # Reset for read phase
     system.reset_for_read()
+    
+    # Reset collector for read-only metrics
+    collector.clear()
+    collector._data_bytes_received = 0
+    collector._data_flits_received = 0
 
     if verbose:
         print("\nPhase 2: Reading data back from all nodes...")
 
     # Read phase
+    read_phase_start_cycle = system.current_time
     read_axi_id = 1000
     outstanding = {}
     completed = 0
@@ -631,6 +637,22 @@ def run_broadcast_read(config: TransferConfig, verbose: bool = True, bin_file: s
     collector.set_zero_load_latency(zero_load_latency)
 
     booksim_metrics = collector.get_booksim_metrics()
+    
+    # Fix: Use read phase cycles for accurate throughput
+    read_phase_cycles = system.current_time - read_phase_start_cycle
+    if read_phase_cycles > 0:
+        booksim_metrics = BookSimMetrics(
+            throughput=booksim_metrics.total_bytes / read_phase_cycles,
+            total_packets=booksim_metrics.total_packets,
+            total_cycles=read_phase_cycles,
+            avg_latency=booksim_metrics.avg_latency,
+            min_latency=booksim_metrics.min_latency,
+            max_latency=booksim_metrics.max_latency,
+            zero_load_latency=booksim_metrics.zero_load_latency,
+            saturation_factor=booksim_metrics.saturation_factor,
+            saturation_status=booksim_metrics.saturation_status,
+            bytes_per_flit=booksim_metrics.bytes_per_flit,
+        )
 
     if verbose:
         print_booksim_metrics(booksim_metrics)
@@ -1417,7 +1439,7 @@ def run_multi_transfer(
     )
     collector.set_zero_load_latency(zero_load_latency)
 
-    booksim_metrics = collector.get_booksim_metrics()
+    booksim_metrics = collector.get_booksim_metrics(total_cycles=cycle)
 
     if verbose:
         print_booksim_metrics(booksim_metrics)

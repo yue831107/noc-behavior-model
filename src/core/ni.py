@@ -835,9 +835,13 @@ class _SlaveNI_RspPath:
                 if injection_cycle is not None:
                     latency = current_time - injection_cycle
                     axi_ch = flit.hdr.axi_ch
-                    # Only R flits carry user data (32 bytes per beat)
+                    # Calculate actual payload bytes (R flit only)
                     # B is response-only, no user data
-                    payload_bytes = 32 if axi_ch == AxiChannel.R else 0
+                    payload_bytes = 0
+                    if axi_ch == AxiChannel.R and flit.payload is not None:
+                        # R flit data length (typically 32 bytes)
+                        data = getattr(flit.payload, 'data', b'')
+                        payload_bytes = len(data) if data else 32
                     self._flit_latency_callback(latency, axi_ch, payload_bytes)
 
             # Try to reconstruct packet
@@ -1845,9 +1849,13 @@ class MasterNI:
                 if injection_cycle is not None:
                     latency = current_time - injection_cycle
                     axi_ch = flit.hdr.axi_ch
-                    # Only W flits carry user data (32 bytes per beat)
+                    # Calculate actual payload bytes from strb (W flit only)
                     # AW/AR are address-only, no user data
-                    payload_bytes = 32 if axi_ch == AxiChannel.W else 0
+                    payload_bytes = 0
+                    if axi_ch == AxiChannel.W and flit.payload is not None:
+                        # Count set bits in strb to get valid bytes
+                        strb = getattr(flit.payload, 'strb', 0xFFFFFFFF)
+                        payload_bytes = bin(strb).count('1')
                     self._flit_latency_callback(latency, axi_ch, payload_bytes)
 
             # Try to reconstruct packet

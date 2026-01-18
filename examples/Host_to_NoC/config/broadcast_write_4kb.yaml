@@ -1,10 +1,34 @@
-# Host to NoC - 4KB Broadcast Write Test
-# Tests HoL blocking behavior with larger transfer
+# Host to NoC - Broadcast Write Test (4KB)
+# Writes same 4KB data to all compute nodes
 
-transfers:
-  - src_addr: 0x0000
-    src_size: 4096            # 4KB data
-    dst_addr: 0x1000
-    target_nodes: "all"       # All 16 nodes = 64KB total
-    transfer_mode: "broadcast"
-    max_outstanding: 8
+# System configuration
+topology:
+  mesh_rows: 4
+  mesh_cols: 5
+  edge_column: 0
+
+router:
+  buffer_depth: 16
+
+# Transfer configuration
+transfer:
+  src_addr: 0x0000          # Host memory source address
+  src_size: 4096            # 4KB data size
+  dst_addr: 0x1000          # Local memory destination address
+  target_nodes: "all"       # Write to all 16 nodes
+
+  # AXI burst settings
+  max_burst_len: 16
+  beat_size: 32              # Match AXI data width (256 bits = 32 bytes)
+  max_outstanding: 8
+
+  # Transfer mode
+  transfer_mode: "broadcast"
+
+  # Pacing
+  inter_txn_delay: 0
+
+# Simulation settings
+simulation:
+  max_cycles: 50000
+  verbose: false

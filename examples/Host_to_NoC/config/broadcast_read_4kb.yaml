@@ -1,5 +1,5 @@
-# Host to NoC - Broadcast Read Test
-# Reads same address from all compute nodes
+# Host to NoC - Broadcast Read Test (4KB)
+# Reads same 4KB address from all compute nodes
 
 # System configuration
 topology:
@@ -8,17 +8,17 @@ topology:
   edge_column: 0
 
 router:
-  buffer_depth: 4
+  buffer_depth: 16
 
 # Transfer configuration
 transfer:
-  # Source settings (for write phase if needed)
+  # Source settings (for initial write)
   src_addr: 0x0000
-  src_size: 1024
+  src_size: 4096            # 4KB
 
   # Read settings
   read_src_addr: 0x1000     # Address to read from in Local Memory
-  read_size: 1024           # Bytes to read per node
+  read_size: 4096           # 4KB to read per node
   target_nodes: "all"       # Read from all 16 nodes
 
   # AXI burst settings
@@ -34,5 +34,5 @@ transfer:
 
 # Simulation settings
 simulation:
-  max_cycles: 10000
+  max_cycles: 50000
   verbose: false

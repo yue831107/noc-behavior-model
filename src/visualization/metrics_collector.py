@@ -575,7 +575,7 @@ class MetricsCollector:
         """
         self._zero_load_latency = latency
 
-    def get_booksim_metrics(self, bytes_per_flit: int = 32) -> BookSimMetrics:
+    def get_booksim_metrics(self, bytes_per_flit: int = 32, total_cycles: Optional[int] = None) -> BookSimMetrics:
         """
         Get BookSim2-style performance metrics.
 
@@ -590,6 +590,8 @@ class MetricsCollector:
         Args:
             bytes_per_flit: Bytes per flit for display (default 32).
                 Only used if no data bytes were tracked.
+            total_cycles: Override total cycles for throughput calculation.
+                If None, uses last snapshot's cycle.
 
         Returns:
             BookSimMetrics dataclass with all metrics.
@@ -600,7 +602,10 @@ class MetricsCollector:
         max_latency = latency_stats.get("max", 0)
 
         # Get cycle and packet counts
-        total_cycles = self.snapshots[-1].cycle if self.snapshots else 1
+        if total_cycles is not None:
+            _total_cycles = total_cycles
+        else:
+            _total_cycles = self.snapshots[-1].cycle if self.snapshots else 1
 
         # Use tracked data bytes (W/R flits only) if available
         # Otherwise fall back to all flits * bytes_per_flit
@@ -613,7 +618,7 @@ class MetricsCollector:
             total_bytes = total_packets * bytes_per_flit
 
         # Calculate throughput (bytes/cycle)
-        throughput = total_bytes / total_cycles if total_cycles > 0 else 0.0
+        throughput = total_bytes / _total_cycles if _total_cycles > 0 else 0.0
 
         # Determine zero-load latency
         zero_load = self._zero_load_latency
@@ -628,7 +633,7 @@ class MetricsCollector:
         return BookSimMetrics(
             throughput=throughput,
             total_packets=total_packets,
-            total_cycles=total_cycles,
+            total_cycles=_total_cycles,
             avg_latency=avg_latency,
             min_latency=float(min_latency),
             max_latency=float(max_latency),

@@ -23,7 +23,7 @@ transfer:
 
   # AXI burst settings
   max_burst_len: 16
-  beat_size: 8
+  beat_size: 32              # Match AXI data width (256 bits = 32 bytes)
   max_outstanding: 8
 
   # Transfer mode
