@@ -66,7 +66,12 @@ def ni_config() -> NIConfig:
 
 @pytest.fixture(autouse=True)
 def reset_flit_counters():
-    """Reset RoB index counter before each test."""
+    """Reset RoB index counter before each test.
+
+    Note: This is process-safe for pytest-xdist parallel execution.
+    Each worker process has its own Python interpreter and class variables,
+    so FlitFactory._rob_idx_counter is effectively process-local.
+    """
     FlitFactory.reset()
     yield
 

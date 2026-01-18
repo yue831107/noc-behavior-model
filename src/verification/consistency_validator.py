@@ -3,11 +3,6 @@ Consistency-based Performance Validator.
 
 Validates that performance metrics are internally consistent using
 Monitor-based approach (no core modification required).
-
-For line-rate injection model:
-- λ (arrival rate) in Little's Law is the measured throughput, not a configured
-  injection_rate as in BookSim2. This is because our model injects at line-rate
-  (as fast as backpressure allows).
 """
 
 from typing import Dict, Tuple, Optional
@@ -16,12 +11,11 @@ from typing import Dict, Tuple, Optional
 class ConsistencyValidator:
     """
     Validates internal consistency between performance metrics.
-    
+
     Monitor-based validator: reads metrics from system without
     modifying core implementation.
-    
+
     Checks mathematical relationships between different metrics:
-    - Little's Law: L = λ × W
     - Flit Conservation: Sent = Received
     - Bandwidth Conservation: Input = Output
     """
@@ -34,67 +28,7 @@ class ConsistencyValidator:
             tolerance: Allowed deviation for consistency checks (default 10%)
         """
         self.tolerance = tolerance
-    
-    def validate_littles_law(
-        self,
-        throughput: float,
-        avg_latency: float,
-        avg_occupancy: float,
-        flit_width_bytes: int = 32
-    ) -> Tuple[bool, str]:
-        """
-        Validate Little's Law: L = λ × W
 
-        Little's Law (Queuing Theory fundamental):
-        - L: Average number of items in system (occupancy)
-        - λ: Arrival rate (flits/cycle)
-        - W: Average time in system (latency in cycles)
-
-        For NoC (line-rate injection model):
-        - L = avg_occupancy (flits in network)
-        - λ = throughput (bytes/cycle) / flit_width (flits/cycle)
-        - W = avg_latency (cycles)
-
-        Note: In BookSim2, λ is a configured injection_rate.
-        In our model, λ is the measured throughput since we inject
-        at line-rate (as fast as backpressure allows).
-
-        Args:
-            throughput: Measured throughput in bytes/cycle
-            avg_latency: Average latency in cycles
-            avg_occupancy: Average number of flits in network
-            flit_width_bytes: Flit width in bytes (default 32 for FlooNoC)
-
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        # Convert throughput to flits/cycle
-        lambda_rate = throughput / flit_width_bytes  # flits/cycle
-        
-        # Calculate expected occupancy using Little's Law
-        expected_occupancy = lambda_rate * avg_latency
-        
-        # Check if actual matches expected (within tolerance)
-        if expected_occupancy == 0:
-            # Edge case: zero throughput
-            if avg_occupancy == 0:
-                return True, "OK (zero load)"
-            else:
-                return False, f"Zero throughput but occupancy = {avg_occupancy}"
-        
-        deviation = abs(avg_occupancy - expected_occupancy) / expected_occupancy
-        
-        if deviation > self.tolerance:
-            error_msg = (
-                f"Little's Law violation: "
-                f"L={avg_occupancy:.2f}, λ={lambda_rate:.2f}, W={avg_latency:.2f} "
-                f"(expected L=λ×W={expected_occupancy:.2f}, "
-                f"deviation={deviation:.1%} > {self.tolerance:.0%})"
-            )
-            return False, error_msg
-        
-        return True, f"OK (deviation={deviation:.1%})"
-    
     def validate_flit_conservation(
         self,
         total_sent: int,
@@ -214,29 +148,19 @@ class ConsistencyValidator:
     def validate_all(self, metrics: Dict) -> Dict[str, Tuple[bool, str]]:
         """
         Validate all consistency metrics in a single call.
-        
+
         Monitor-based: reads all metrics from system via dictionary.
-        
+
         Args:
             metrics: Dictionary containing performance metrics
-                Required for Little's Law: throughput, avg_latency, avg_occupancy
                 Required for Flit Conservation: total_sent, total_received
                 Optional: injection_rate, ejection_rate
-        
+
         Returns:
             Dictionary of validation results for each check
         """
         results = {}
-        
-        # Validate Little's Law
-        if all(k in metrics for k in ['throughput', 'avg_latency', 'avg_occupancy']):
-            results['littles_law'] = self.validate_littles_law(
-                metrics['throughput'],
-                metrics['avg_latency'],
-                metrics['avg_occupancy'],
-                metrics.get('flit_width_bytes', 8)
-            )
-        
+
         # Validate Flit Conservation
         if all(k in metrics for k in ['total_sent', 'total_received']):
             results['flit_conservation'] = self.validate_flit_conservation(

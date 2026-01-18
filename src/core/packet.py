@@ -152,7 +152,7 @@ class PacketAssembler:
         else:
             num_w_flits = (data_len + self.flit_payload_size - 1) // self.flit_payload_size
 
-        # AW flit (no last=True because W follows)
+        # AW flit (FlooNoC: AW is single-flit packet, last=True)
         aw_flit = FlitFactory.create_aw(
             src=packet.src,
             dest=packet.dest,
@@ -163,7 +163,7 @@ class PacketAssembler:
             burst=1,  # INCR
             rob_idx=packet.rob_idx,
             rob_req=True,
-            last=False,
+            last=True,  # FlooNoC: AW is single-flit packet
         )
         flits.append(aw_flit)
 
@@ -614,13 +614,24 @@ class PacketFactory:
         axi_id: int,
         data: bytes,
         timestamp: int = 0,
+        rob_idx: Optional[int] = None,
     ) -> Packet:
         """
         Create a read response packet from routing info.
 
         Used by MasterNI when it doesn't have the original request packet.
+
+        Args:
+            src: Source coordinate.
+            dest: Destination coordinate.
+            axi_id: AXI transaction ID.
+            data: Read data payload.
+            timestamp: Packet timestamp.
+            rob_idx: RoB index (uses original request's rob_idx for matching).
+                     If None, generates a new one (not recommended for multi-flit).
         """
-        rob_idx = cls._next_rob_idx()
+        if rob_idx is None:
+            rob_idx = cls._next_rob_idx()
         return Packet(
             packet_id=rob_idx,
             packet_type=PacketType.READ_RESP,

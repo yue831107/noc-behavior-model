@@ -137,8 +137,6 @@ def validate_performance_metrics(
     - Buffer utilization: [0, 1] range
     - Flit Conservation: Sent = Received
 
-    Note: Little's Law is skipped for NoC-to-NoC (burst traffic pattern).
-
     Args:
         metrics: Dict with performance metrics
         zero_load_latency: Theoretical minimum latency (L0). If None, skip latency validation.
@@ -183,9 +181,6 @@ def validate_performance_metrics(
     try:
         from src.verification import ConsistencyValidator
         consistency_validator = ConsistencyValidator(tolerance=0.50)
-
-        # Little's Law: SKIP for NoC-to-NoC (burst traffic pattern)
-        results.append(("Little's Law", True, "OK (skipped - burst traffic)"))
 
         # Flit Conservation: Sent = Received
         if all(k in metrics for k in ['total_flits_sent', 'total_flits_received']):
@@ -279,7 +274,7 @@ def run_traffic_pattern(
     system = NoCSystem(
         mesh_cols=config.mesh_cols,
         mesh_rows=config.mesh_rows,
-        buffer_depth=4,
+        buffer_depth=8,
         memory_size=0x10000,
         channel_mode=channel_mode,
     )

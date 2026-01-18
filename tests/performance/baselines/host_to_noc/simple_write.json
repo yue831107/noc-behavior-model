@@ -1,0 +1,12 @@
+{
+  "name": "host_to_noc/simple_write",
+  "metrics": {
+    "throughput_gbps": 0.0,
+    "avg_latency_cycles": 100.0,
+    "completed_transactions": 0,
+    "total_cycles": 1000
+  },
+  "timestamp": "2026-01-15T20:13:12.260354",
+  "commit_hash": null,
+  "description": "Initial baseline: 10 transfers"
+}

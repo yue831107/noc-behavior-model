@@ -35,6 +35,7 @@ sys.path.insert(0, str(project_root))
 
 from src.config import TransferConfig, TransferMode, NoCTrafficConfig, TrafficPattern
 from src.core.routing_selector import V1System, NoCSystem
+from src.core.router import ChannelMode
 from src.visualization import MetricsCollector
 from src.traffic.pattern_generator import TrafficPatternGenerator
 from src.verification import TheoryValidator, ConsistencyValidator

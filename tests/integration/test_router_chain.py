@@ -227,7 +227,7 @@ class TestSouthPropagation:
         r1, r2, r3 = routers
 
         # Flit destined for position SOUTH of R1
-        flit = single_flit_factory(src=(1, 4), dest=(1, 0))
+        flit = single_flit_factory(src=(1, 3), dest=(1, 0))
 
         # Inject at R3's NORTH port
         r3.ports[Direction.NORTH].receive(flit)

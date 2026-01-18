@@ -156,7 +156,7 @@ class TestWormholeArbiterArbitration:
     ):
         """Requests for different outputs should all be granted."""
         flit1 = single_flit_factory(src=(0, 0), dest=(4, 2))
-        flit2 = single_flit_factory(src=(0, 0), dest=(2, 4))
+        flit2 = single_flit_factory(src=(0, 0), dest=(2, 3))
 
         requests = {
             Direction.WEST: (flit1, Direction.EAST),
@@ -291,7 +291,7 @@ class TestWormholeArbiterPacketScenarios:
     ):
         """Two packets to different outputs can proceed in parallel."""
         packet_a = multi_flit_packet_factory(src=(0, 0), dest=(4, 2), num_flits=2)
-        packet_b = multi_flit_packet_factory(src=(0, 0), dest=(2, 4), num_flits=2)
+        packet_b = multi_flit_packet_factory(src=(0, 0), dest=(2, 3), num_flits=2)
 
         head_a = packet_a[0]
         head_b = packet_b[0]

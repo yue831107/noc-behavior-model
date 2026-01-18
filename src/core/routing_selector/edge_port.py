@@ -25,7 +25,7 @@ class EdgeRouterPort:
     def __init__(
         self,
         row: int,
-        buffer_depth: int = 8
+        buffer_depth: int = 32
     ):
         """
         Initialize edge router port.
@@ -165,7 +165,7 @@ class AXIModeEdgeRouterPort:
     def __init__(
         self,
         row: int,
-        buffer_depth: int = 8
+        buffer_depth: int = 32
     ):
         """
         Initialize AXI Mode edge router port.

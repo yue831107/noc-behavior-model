@@ -17,7 +17,7 @@ AXI Compliance:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Deque, TYPE_CHECKING
+from typing import Optional, List, Dict, Tuple, Deque, Set, TYPE_CHECKING
 from collections import deque
 from enum import Enum
 
@@ -25,6 +25,7 @@ from ..axi.interface import (
     AXI_AW, AXI_W, AXI_B, AXI_AR, AXI_R,
     AXISize, AXIBurst, AXIResp,
 )
+from ..core.router import ChannelMode
 
 if TYPE_CHECKING:
     from .memory import Memory
@@ -95,6 +96,12 @@ class PendingBurst:
     w_beats_total: int = 0
     b_received: bool = False
 
+    # Timing (for latency tracking)
+    aw_sent_cycle: int = 0
+    first_w_cycle: int = 0
+    last_w_cycle: int = 0
+    b_received_cycle: int = 0
+
 
 class LocalAXIMaster:
     """
@@ -157,12 +164,20 @@ class LocalAXIMaster:
         self._state = LocalAXIMasterState.IDLE
         self._current_cycle = 0
 
-        # Burst queue (multiple AXI transactions from splitting)
-        self._burst_queue: Deque[PendingBurst] = deque()
-        self._current_burst: Optional[PendingBurst] = None
+        # True AXI Outstanding support
+        # 按狀態追蹤 bursts
+        self._aw_pending: Deque[PendingBurst] = deque()   # AW 尚未送出
+        self._w_active: Dict[int, PendingBurst] = {}      # W 進行中 (by axi_id)
+        self._b_pending: Dict[int, PendingBurst] = {}     # 等待 B response
+
+        # W 發送順序 (FIFO - 按 AW 發送順序)
+        self._w_send_order: Deque[int] = deque()
 
         # AXI ID counter
         self._next_axi_id = 0
+
+        # Outstanding limit
+        self._max_outstanding = 16
 
         # Statistics
         self.stats = LocalAXIMasterStats()
@@ -200,8 +215,10 @@ class LocalAXIMaster:
         """Reset master to IDLE state."""
         self._state = LocalAXIMasterState.IDLE
         self._current_cycle = 0
-        self._burst_queue.clear()
-        self._current_burst = None
+        self._aw_pending.clear()
+        self._w_active.clear()
+        self._b_pending.clear()
+        self._w_send_order.clear()
         self.stats = LocalAXIMasterStats()
 
     def _split_into_bursts(
@@ -278,9 +295,11 @@ class LocalAXIMaster:
         user_signal = config.encode_user_signal()
         bursts = self._split_into_bursts(config.local_dst_addr, data, user_signal)
 
-        # Initialize burst queue
-        self._burst_queue = deque(bursts)
-        self._current_burst = None
+        # Initialize state - all bursts start in aw_pending
+        self._aw_pending = deque(bursts)
+        self._w_active.clear()
+        self._b_pending.clear()
+        self._w_send_order.clear()
 
         # Reset state
         self._state = LocalAXIMasterState.RUNNING
@@ -289,11 +308,19 @@ class LocalAXIMaster:
 
     def process_cycle(self, cycle: int) -> None:
         """
-        Process one simulation cycle.
+        Process one simulation cycle with true AXI outstanding pipelining.
 
-        Cycle-accurate behavior:
-        - At most ONE AXI beat (AW or W) sent per cycle
-        - B responses can be received in parallel
+        Pipelined behavior (AW first, then W):
+        - Phase 1 (AW): Send if outstanding < max_outstanding (不等 W 完成)
+        - Phase 2 (W): FIFO 順序發送 (按 AW 發送順序，AXI4 不支援 W interleaving)
+        - Phase 3 (B): Receive B responses
+
+        Channel Mode 差異:
+        - General Mode: AW/W 互斥 (共用 Request channel)
+        - AXI Mode: AW + W 可並行 (獨立 channel)
+
+        Note: AW pipelining is safe in General Mode because Router's wormhole
+        locking only triggers on W/R flits, not on AW/AR flits.
 
         Args:
             cycle: Current simulation cycle.
@@ -304,43 +331,49 @@ class LocalAXIMaster:
         self._current_cycle = cycle
         self.stats.total_cycles = cycle + 1
 
-        # Get current burst or start next one
-        if self._current_burst is None:
-            if self._burst_queue:
-                self._current_burst = self._burst_queue.popleft()
-            else:
-                # All bursts complete
-                self._state = LocalAXIMasterState.COMPLETE
-                return
+        # 判斷是否為 AXI Mode
+        is_axi_mode = (self._slave_ni is not None and
+                       self._slave_ni.config.channel_mode == ChannelMode.AXI)
+        aw_sent_this_cycle = False
+        w_sent_this_cycle = False
 
-        burst = self._current_burst
+        # === Phase 1: Send AW (pipelined - 不等 W 完成) ===
+        outstanding_count = len(self._w_active) + len(self._b_pending)
 
-        # IMPORTANT: Only ONE of AW or W can be sent per cycle
-        beat_sent_this_cycle = False
-
-        # Phase 1: Send AW (Write Address) - only if no beat sent yet
-        if not burst.aw_sent and not beat_sent_this_cycle:
+        if self._aw_pending and outstanding_count < self._max_outstanding:
+            burst = self._aw_pending[0]
             if self._try_send_aw(burst, cycle):
-                beat_sent_this_cycle = True
+                self._aw_pending.popleft()
+                burst.aw_sent_cycle = cycle
+                self._w_active[burst.axi_id] = burst
+                self._w_send_order.append(burst.axi_id)
+                aw_sent_this_cycle = True
 
-        # Phase 2: Send W (Write Data) - only if no beat sent yet this cycle
-        if burst.aw_sent and not beat_sent_this_cycle:
-            if burst.w_beats_sent < burst.w_beats_total:
-                if self._try_send_w(burst, cycle):
-                    beat_sent_this_cycle = True
+        # === Phase 2: Send W beats (FIFO - 按 AW 順序) ===
+        # General Mode: 若已送 AW 則跳過 W (互斥)
+        # AXI Mode: 可同時送 AW + W (並行)
+        can_send_w = is_axi_mode or not aw_sent_this_cycle
+        if self._w_send_order and can_send_w:
+            axi_id = self._w_send_order[0]
+            if axi_id in self._w_active:
+                burst = self._w_active[axi_id]
+                if burst.w_beats_sent < burst.w_beats_total:
+                    if self._try_send_w(burst, cycle):
+                        if burst.first_w_cycle == 0:
+                            burst.first_w_cycle = cycle
+                        w_sent_this_cycle = True
+                        if burst.w_beats_sent >= burst.w_beats_total:
+                            burst.last_w_cycle = cycle
+                            del self._w_active[axi_id]
+                            self._w_send_order.popleft()
+                            self._b_pending[axi_id] = burst
 
-        # Phase 3: Receive B (Write Response) - can happen in parallel
-        if burst.w_beats_sent >= burst.w_beats_total and not burst.b_received:
-            self._try_receive_b(burst, cycle)
+        # === Phase 3: Receive B responses ===
+        self._try_receive_b_responses(cycle)
 
-        # Check if current burst is complete
-        if burst.b_received:
-            self.stats.transactions_completed += 1
-            self._current_burst = None
-
-            # Check if all transfers done
-            if not self._burst_queue:
-                self._state = LocalAXIMasterState.COMPLETE
+        # === Phase 4: Check completion ===
+        if not self._aw_pending and not self._w_active and not self._b_pending:
+            self._state = LocalAXIMasterState.COMPLETE
 
     def _try_send_aw(self, burst: PendingBurst, cycle: int) -> bool:
         """
@@ -407,16 +440,24 @@ class LocalAXIMaster:
             return True
         return False
 
-    def _try_receive_b(self, burst: PendingBurst, cycle: int) -> None:
-        """Try to receive B response for a burst."""
+    def _try_receive_b_responses(self, cycle: int) -> None:
+        """Try to receive B responses for pending bursts."""
         if self._slave_ni is None:
             return
 
+        # Try to receive B responses for any pending burst
         b_resp = self._slave_ni.get_b_response()
-        if b_resp is not None and b_resp.bid == burst.axi_id:
-            burst.b_received = True
-            self.stats.b_received += 1
-            self.stats.last_b_cycle = cycle
+        if b_resp is not None:
+            axi_id = b_resp.bid
+            if axi_id in self._b_pending:
+                burst = self._b_pending[axi_id]
+                burst.b_received = True
+                burst.b_received_cycle = cycle
+                del self._b_pending[axi_id]
+
+                self.stats.b_received += 1
+                self.stats.last_b_cycle = cycle
+                self.stats.transactions_completed += 1
 
     @property
     def is_complete(self) -> bool:

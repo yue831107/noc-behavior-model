@@ -139,7 +139,7 @@ class NoCSystem:
         self,
         mesh_cols: int = 5,
         mesh_rows: int = 4,
-        buffer_depth: int = 4,
+        buffer_depth: int = 32,
         memory_size: int = 0x100000000,
         channel_mode: ChannelMode = ChannelMode.GENERAL,
     ):

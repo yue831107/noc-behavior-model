@@ -78,9 +78,20 @@ def encode_node_id(coord: tuple[int, int]) -> int:
 
     Returns:
         5-bit node ID
+
+    Raises:
+        ValueError: If coordinates are out of valid range.
     """
     x, y = coord
-    return ((x & 0x7) << Y_BITS) | (y & 0x3)
+    max_x = (1 << X_BITS) - 1  # 7
+    max_y = (1 << Y_BITS) - 1  # 3
+
+    if not (0 <= x <= max_x):
+        raise ValueError(f"x coordinate {x} out of range [0, {max_x}]")
+    if not (0 <= y <= max_y):
+        raise ValueError(f"y coordinate {y} out of range [0, {max_y}]")
+
+    return (x << Y_BITS) | y
 
 
 def decode_node_id(node_id: int) -> tuple[int, int]:
@@ -94,7 +105,15 @@ def decode_node_id(node_id: int) -> tuple[int, int]:
 
     Returns:
         (x, y) coordinate tuple
+
+    Raises:
+        ValueError: If node_id is out of valid range.
     """
+    max_node_id = (1 << NODE_ID_BITS) - 1  # 31
+
+    if not (0 <= node_id <= max_node_id):
+        raise ValueError(f"node_id {node_id} out of range [0, {max_node_id}]")
+
     x = (node_id >> Y_BITS) & 0x7
     y = node_id & 0x3
     return (x, y)
@@ -242,14 +261,23 @@ class FlitHeader:
 
     @classmethod
     def from_int(cls, value: int) -> FlitHeader:
-        """Unpack header from 20-bit integer."""
+        """
+        Unpack header from 20-bit integer.
+
+        Raises:
+            ValueError: If axi_ch value is invalid.
+        """
+        axi_ch_val = (value >> 17) & 0x7
+        if axi_ch_val > 4:
+            raise ValueError(f"Invalid axi_ch value: {axi_ch_val} (valid range: 0-4)")
+
         return cls(
             rob_req=bool(value & 0x1),
             rob_idx=(value >> 1) & 0x1F,
             dst_id=(value >> 6) & 0x1F,
             src_id=(value >> 11) & 0x1F,
             last=bool((value >> 16) & 0x1),
-            axi_ch=AxiChannel((value >> 17) & 0x7),
+            axi_ch=AxiChannel(axi_ch_val),
         )
 
     def __repr__(self) -> str:
@@ -289,16 +317,22 @@ class Flit:
 
     # Internal tracking (not part of wire format)
     _seq_num: int = field(default=0, repr=False)
+    injection_cycle: Optional[int] = field(default=None, repr=False)
 
     def is_head(self) -> bool:
-        """Check if this flit starts a packet (AW/AR/B or first R)."""
-        # W never starts a packet (always follows AW)
-        if self.hdr.axi_ch == AxiChannel.W:
-            return False
-        # AW, AR, B start packets
+        """Check if this flit starts a packet.
+
+        FlooNoC packet structure:
+        - AW: Single flit packet (last=1)
+        - AR: Single flit packet (last=1)
+        - B: Single flit packet (last=1)
+        - W: Independent data packet (first W is HEAD, last W has last=1)
+        - R: Independent data packet (first R is HEAD, last R has last=1)
+        """
+        # AW, AR, B are always single-flit packets (HEAD)
         if self.hdr.axi_ch in (AxiChannel.AW, AxiChannel.AR, AxiChannel.B):
             return True
-        # For R, check if this is the first flit (seq_num == 0)
+        # W and R: first flit (seq_num == 0) is HEAD
         return self._seq_num == 0
 
     def is_tail(self) -> bool:

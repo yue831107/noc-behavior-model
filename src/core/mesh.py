@@ -9,7 +9,7 @@ Creates and connects routers in a 2D mesh pattern with:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Union
 
 from .router import (
     Router, EdgeRouter, Direction, RouterConfig, RouterPort,
@@ -106,15 +106,18 @@ class Mesh:
             )
         )
 
-        # Router storage: (x, y) -> Router
-        self.routers: Dict[Tuple[int, int], Router] = {}
+        # Router storage: (x, y) -> Router (any type)
+        self.routers: Dict[
+            Tuple[int, int],
+            Union[Router, EdgeRouter, AXIModeRouter, AXIModeEdgeRouter]
+        ] = {}
 
         # NI storage: (x, y) -> MasterNI (only for compute nodes)
         # Note: Compute nodes have MasterNI (AXI Master to Memory)
         self.nis: Dict[Tuple[int, int], MasterNI] = {}
 
-        # Edge routers quick access
-        self.edge_routers: List[EdgeRouter] = []
+        # Edge routers quick access (both General and AXI mode)
+        self.edge_routers: List[Union[EdgeRouter, AXIModeEdgeRouter]] = []
 
         # Wire connections (for valid/ready signal propagation)
         # General Mode: Req/Resp separation
@@ -276,6 +279,9 @@ class Mesh:
 
             if self.config.channel_mode == ChannelMode.AXI:
                 # AXI Mode: Create virtual ports for all 5 channels
+                # Type narrowing for mypy
+                assert isinstance(router, AXIModeRouter)
+
                 # Request channels: AW, W, AR
                 for channel in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
                     ch_local = router.get_channel_port(channel, Direction.LOCAL)
@@ -444,6 +450,9 @@ class Mesh:
 
             if self.config.channel_mode == ChannelMode.AXI:
                 # AXI Mode: Check all 3 request channels (AW, W, AR)
+                # Type narrowing for mypy
+                assert isinstance(router, AXIModeRouter)
+
                 for channel in [AxiChannel.AW, AxiChannel.W, AxiChannel.AR]:
                     req_local = router.get_channel_port(channel, Direction.LOCAL)
                     if req_local.out_valid and req_local.out_flit is not None:
@@ -456,13 +465,14 @@ class Mesh:
                 # AXI Mode: Responses go to B or R channel
                 # For now, use B channel for write responses, R for read
                 # (NI Phase 3 will add per-channel output selection)
+                # Must also check out_ready to prevent flit loss.
                 if ni.has_pending_response():
                     flit = ni.peek_resp_flit()
                     if flit is not None:
                         # Determine channel from flit's axi_ch
                         resp_channel = flit.hdr.axi_ch
                         resp_local = router.get_channel_port(resp_channel, Direction.LOCAL)
-                        if not resp_local.in_valid:
+                        if not resp_local.in_valid and resp_local.out_ready:
                             flit = ni.get_resp_flit()
                             if flit is not None:
                                 resp_local.in_valid = True
@@ -480,8 +490,13 @@ class Mesh:
                         self.stats.total_req_flits += 1
 
                 # Transfer from NI response output to Router resp_LOCAL input
+                # Must check out_ready to ensure router buffer has space,
+                # otherwise flit will be lost when sample_input fails but
+                # clear_input_signals still clears the wire.
                 resp_local = router.get_resp_port(Direction.LOCAL)
-                if ni.has_pending_response() and not resp_local.in_valid:
+                if (ni.has_pending_response() and
+                        not resp_local.in_valid and
+                        resp_local.out_ready):
                     flit = ni.get_resp_flit()
                     if flit is not None:
                         resp_local.in_valid = True
@@ -559,7 +574,7 @@ def create_mesh(
     cols: int = 5,
     rows: int = 4,
     edge_column: int = 0,
-    buffer_depth: int = 4,
+    buffer_depth: int = 32,
     channel_mode: ChannelMode = ChannelMode.GENERAL
 ) -> Mesh:
     """

@@ -1,0 +1,12 @@
+{
+  "name": "noc_to_noc/neighbor_simple",
+  "metrics": {
+    "throughput_gbps": 0.0,
+    "avg_latency_cycles": 0.0,
+    "completed_transactions": 0,
+    "total_cycles": 0
+  },
+  "timestamp": "2026-01-15T20:13:23.861260",
+  "commit_hash": null,
+  "description": "Initial baseline: 10 transfers"
+}

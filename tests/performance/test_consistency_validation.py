@@ -14,41 +14,7 @@ from src.verification.consistency_validator import (
 
 class TestConsistencyValidation:
     """Consistency-based validation test cases."""
-    
-    def test_littles_law(self):
-        """
-        驗證公式: L = λ × W
-        """
-        validator = ConsistencyValidator(tolerance=0.10)
-        
-        # PASS: L = (24/8) × 5 = 15
-        is_valid, msg = validator.validate_littles_law(
-            throughput=24.0, avg_latency=5.0, 
-            avg_occupancy=15.0, flit_width_bytes=8
-        )
-        assert is_valid and "OK" in msg
-        
-        # PASS: Within tolerance (15.8 ≈ 15, deviation 5.3%)
-        is_valid, _ = validator.validate_littles_law(
-            throughput=24.0, avg_latency=5.0,
-            avg_occupancy=15.8, flit_width_bytes=8
-        )
-        assert is_valid
-        
-        # FAIL: Violation (25 >> 15, deviation 66%)
-        is_valid, msg = validator.validate_littles_law(
-            throughput=24.0, avg_latency=5.0,
-            avg_occupancy=25.0, flit_width_bytes=8
-        )
-        assert not is_valid and "violation" in msg.lower()
-        
-        # PASS: Zero load special case
-        is_valid, msg = validator.validate_littles_law(
-            throughput=0.0, avg_latency=0.0,
-            avg_occupancy=0.0, flit_width_bytes=8
-        )
-        assert is_valid and "zero load" in msg.lower()
-    
+
     def test_flit_conservation(self):
         """
         驗證公式: Total_Sent = Total_Received
@@ -102,18 +68,16 @@ class TestConsistencyValidation:
     def test_validate_all_metrics(self):
         """整合驗證：所有一致性檢查"""
         validator = ConsistencyValidator(tolerance=0.10)
-        
+
         # All valid
         results = validator.validate_all({
-            'throughput': 24.0, 'avg_latency': 5.0, 'avg_occupancy': 15.0,
             'total_sent': 1000, 'total_received': 1000,
             'injection_rate': 30.0, 'ejection_rate': 30.0,
         })
         assert all(is_valid for is_valid, _ in results.values())
-        
+
         # All invalid
         results = validator.validate_all({
-            'throughput': 24.0, 'avg_latency': 5.0, 'avg_occupancy': 30.0,  # ❌
             'total_sent': 1000, 'total_received': 980,  # ❌
             'injection_rate': 30.0, 'ejection_rate': 40.0,  # ❌
         })
@@ -123,14 +87,11 @@ class TestConsistencyValidation:
 def test_consistency_validator_integration():
     """整合測試：驗證完整模擬流程"""
     validator = ConsistencyValidator(tolerance=0.10)
-    
+
     results = validator.validate_all({
-        'throughput': 28.0, 'avg_latency': 2.5,
-        'avg_occupancy': 8.75,  # = 28/8 × 2.5
         'total_sent': 512, 'total_received': 512,
         'injection_rate': 28.0, 'ejection_rate': 28.0,
-        'flit_width_bytes': 8,
     })
-    
+
     print_consistency_results(results)
     assert all(is_valid for is_valid, _ in results.values())

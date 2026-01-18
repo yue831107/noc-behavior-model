@@ -93,9 +93,10 @@ pre-commit run --all-files
   - SlaveNI: AXI Slave, converts AXI → NoC flits (request path)
   - MasterNI: AXI Master, converts NoC flits → memory operations (response path)
 
-- **Routing Selector** (`src/core/routing_selector.py`): V1 ingress/egress point
+- **Routing Selector** (`src/core/routing_selector/`): V1 ingress/egress point
   - Path selection based on hop count and credits
   - Connects to 4 Edge Routers via PortWire
+  - Package structure: `selector.py`, `v1_system.py`, `noc_system.py`, `config.py`, `edge_port.py`
 
 ### Simulation Cycle Phases
 
@@ -134,13 +135,21 @@ GoldenManager (`src/verification/golden_manager.py`) handles expected data track
 ```
 src/
 ├── core/          # Core NoC hardware model
-│   ├── router.py  # XYRouter, WormholeArbiter, PortWire
+│   ├── router.py  # XYRouter, WormholeArbiter, PortWire, ChannelMode
 │   ├── mesh.py    # 2D Mesh topology
 │   ├── ni.py      # SlaveNI, MasterNI
-│   ├── routing_selector.py  # V1System, NoCSystem
+│   ├── routing_selector/    # Package: V1System, NoCSystem, RoutingSelector
+│   │   ├── selector.py      # RoutingSelector core logic
+│   │   ├── v1_system.py     # V1System (Host-to-NoC)
+│   │   ├── noc_system.py    # NoCSystem (NoC-to-NoC)
+│   │   ├── config.py        # RoutingSelectorConfig
+│   │   └── edge_port.py     # EdgePortManager
+│   ├── channel_mode_strategy.py  # Strategy pattern for General/AXI mode
 │   ├── flit.py    # FlitHeader, Flit, AXI payloads
 │   ├── packet.py  # PacketAssembler, PacketDisassembler
 │   └── buffer.py  # FlitBuffer
+├── metrics/       # Performance metrics
+│   └── booksim_metrics.py   # BookSim2-style metrics
 ├── testbench/     # DUT peripherals (not part of NoC)
 │   ├── memory.py  # HostMemory, LocalMemory
 │   ├── axi_master.py         # AXIMasterController

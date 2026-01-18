@@ -260,7 +260,7 @@ def create_presentation(output_path: Path):
         "Monitor-Based Architecture: External observation, no core modification",
         "Two-Layer Validation:",
         ("  • Theory Validation: Throughput, Latency bounds", 1),
-        ("  • Consistency Validation: Little's Law, Flit Conservation", 1),
+        ("  • Consistency Validation: Flit Conservation, Bandwidth Conservation", 1),
         "Key Principle: Validator depends on Core (one-way dependency)",
         "MetricsCollector: Unified interface for all metrics",
     ])
@@ -288,7 +288,6 @@ def create_presentation(output_path: Path):
     add_table_slide(prs, "Consistency Validation",
         ["Check", "Formula", "Tolerance"],
         [
-            ["Little's Law", "L = λ × W", "10%"],
             ["Flit Conservation", "Sent = Received", "0%"],
             ["Bandwidth Conservation", "Σ(inject) = Σ(eject)", "10%"],
         ]
@@ -312,7 +311,6 @@ def create_presentation(output_path: Path):
         ["Validation", "Host-to-NoC", "NoC-to-NoC", "Reason"],
         [
             ["Throughput Bound", "✓ Validate", "✗ Skip", "No edge bottleneck"],
-            ["Little's Law", "✓ Validate", "✗ Skip", "Burst traffic"],
             ["Buffer Util", "✓ Validate", "✓ Validate", "Both applicable"],
             ["Flit Conservation", "✓ Validate", "✓ Validate", "Both applicable"],
         ]

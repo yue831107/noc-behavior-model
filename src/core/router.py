@@ -7,7 +7,7 @@ and credit-based flow control.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple, Callable, Union
 from enum import Enum, auto
 
 from .flit import Flit, AxiChannel, decode_node_id
@@ -120,13 +120,13 @@ class PipelineConfig:
 @dataclass
 class RouterConfig:
     """Router configuration parameters."""
-    buffer_depth: int = 4           # Input buffer depth per port (flits)
+    buffer_depth: int = 32          # Input buffer depth per port (flits)
     output_buffer_depth: int = 0    # Output buffer depth (0 = no output buffer)
     flit_width: int = 64            # Flit width in bits
     routing_algorithm: str = "XY"   # Routing algorithm: "XY" only (Y→X disabled)
     arbitration: str = "wormhole"   # Arbitration: "wormhole" (packet locking)
     switching: str = "wormhole"     # Switching: "wormhole" (default)
-    pipeline: PipelineConfig = None # Pipeline configuration
+    pipeline: Optional[PipelineConfig] = None  # Pipeline configuration
     channel_mode: ChannelMode = ChannelMode.GENERAL  # Physical channel mode
 
     def __post_init__(self):
@@ -163,13 +163,44 @@ class WormholeArbiter:
     """
     Wormhole Arbiter - locks input→output path during packet transfer.
 
-    Mechanism:
-    1. When HEAD flit wins arbitration, lock the input→output path
-    2. Subsequent BODY/TAIL flits bypass arbitration and follow locked path
-    3. When TAIL flit is transmitted, release the lock
+    Overview:
+    ---------
+    Manages packet-level locking for Wormhole switching to ensure that
+    flits from the same packet traverse the network atomically without
+    being interleaved with flits from other packets.
 
-    This ensures packet integrity (no flit interleaving) and improves
-    performance by avoiding re-arbitration for each flit.
+    Locking Mechanism:
+    ------------------
+    1. HEAD flit arrives → Competes in arbitration for output port
+    2. HEAD wins → Lock acquired (input_dir → output_dir mapping)
+    3. BODY flits → Bypass arbitration, follow locked path automatically
+    4. TAIL flit transmitted → Lock released, path available for new packets
+
+    Arbitration Policy:
+    -------------------
+    Two-level priority scheme:
+    1. Locked paths (highest): Already-locked input→output pairs are
+       automatically granted without arbitration
+    2. New requests (round-robin): Unlocked requests competing for same
+       output use round-robin to ensure fairness
+
+    Lock State:
+    -----------
+    - output_lock[dir]: Which input holds lock on this output (or None)
+    - input_lock[dir]: Which output this input is locked to (or None)
+
+    Deadlock Consideration:
+    -----------------------
+    Wormhole switching can cause deadlocks if circular buffer dependencies
+    form. This is prevented by using XY routing (dimension-ordered) which
+    guarantees no cyclic dependencies in the routing paths.
+
+    Example:
+    --------
+    Packet A (3 flits) from WEST→EAST:
+        Cycle 1: HEAD arrives, wins arbitration, lock WEST→EAST
+        Cycle 2: BODY arrives, automatically follows locked path
+        Cycle 3: TAIL arrives, follows path, releases lock after transmit
     """
 
     def __init__(self):
@@ -687,14 +718,51 @@ class PortWire:
 
 class XYRouter:
     """
-    XY Routing Router implementation.
+    XY Routing Router implementation with configurable pipeline.
 
-    Implements deterministic XY routing:
-    1. First route along X axis (EAST/WEST)
-    2. Then route along Y axis (NORTH/SOUTH)
+    Routing Algorithm:
+    ------------------
+    Implements deterministic XY routing (dimension-ordered routing):
+    1. First route along X axis (EAST/WEST) until X matches destination
+    2. Then route along Y axis (NORTH/SOUTH) until Y matches destination
+    3. Finally deliver to LOCAL port at destination
 
-    Uses Virtual Cut-Through (VCT) switching - entire packet
-    must be buffered before forwarding.
+    This algorithm is deadlock-free because it prevents cyclic dependencies
+    by never allowing Y→X turns (no EAST/WEST after NORTH/SOUTH).
+
+    Switching:
+    ----------
+    Uses Wormhole switching with packet-level locking:
+    - HEAD flit acquires output port lock
+    - BODY/TAIL flits follow the locked path
+    - TAIL flit releases the lock
+
+    Pipeline Stages:
+    ----------------
+    Configurable via RouterConfig.stages:
+
+    Fast Mode (default, 1 cycle total):
+        Input → Output (single cycle)
+
+    Multi-Stage Mode (e.g., 3 cycles):
+        Stage 1 (RC): Route Computation - determine output direction
+        Stage 2 (SA): Switch Allocation - arbiter grants
+        Stage 3 (ST): Switch Traversal - flit crosses crossbar
+
+    Each stage has configurable latency in cycles.
+
+    Cycle Processing Order:
+    -----------------------
+    1. sample_inputs() - Capture flits from input wires
+    2. clear_input_signals() - Reset wire valid signals
+    3. update_ready() - Update credit/ready signals
+    4. route_and_forward() - Main routing logic
+       a. Advance pipeline (if multi-stage)
+       b. Collect routing requests
+       c. Arbitrate for output ports
+       d. Execute grants
+    5. propagate_signals() - Drive output wire signals
+    6. clear_accepted_outputs() - Pop accepted flits from output buffers
     """
 
     def __init__(
@@ -714,6 +782,9 @@ class XYRouter:
         self.coord = coord
         self.config = config or RouterConfig()
         self.name = name or f"Router({coord[0]},{coord[1]})"
+
+        # AXI channel (set by create_channel_router for AXI Mode)
+        self.axi_channel: Optional[AxiChannel] = None
 
         # Create ports
         self.ports: Dict[Direction, RouterPort] = {}
@@ -741,6 +812,8 @@ class XYRouter:
         self._pipeline_stages: List[List[Tuple[Flit, Direction, Direction, int]]] = []
         
         # Calculate total pipeline depth
+        # pipeline is guaranteed to be set by RouterConfig.__post_init__
+        assert self.config.pipeline is not None
         pipeline_cfg = self.config.pipeline
         self._stage_config = [
             ("RC", pipeline_cfg.rc_latency),
@@ -871,14 +944,40 @@ class XYRouter:
             List of (flit, output_direction) pairs for forwarded flits.
         """
         forwarded: List[Tuple[Flit, Direction]] = []
-        
-        # === Step 1: Process pipeline stages (advance and emit) ===
+
+        # Step 1: Process pipeline stages (advance and emit)
         if len(self._active_stages) > 1:
-            # Multi-stage pipeline: advance flits through stages
             forwarded = self._advance_pipeline(current_time)
-        
-        # === Step 2: Collect routing requests from input ports ===
+
+        # Step 2: Collect routing requests from input ports
+        requests = self._collect_routing_requests()
+
+        # Step 3: Arbiter grants requests
+        grants = self._arbiter.arbitrate(requests)
+
+        # Step 4: Execute grants
+        grant_results = self._execute_grants(grants)
+        forwarded.extend(grant_results)
+
+        if grants:
+            self.stats.arbitration_cycles += 1
+
+        return forwarded
+
+    def _collect_routing_requests(self) -> Dict[Direction, Tuple[Flit, Direction]]:
+        """
+        Collect routing requests from all input ports.
+
+        For each port with a pending flit:
+        1. Compute output direction via XY routing
+        2. Check output availability
+        3. Add to request dictionary if routable
+
+        Returns:
+            Dictionary mapping input direction to (flit, output_direction).
+        """
         requests: Dict[Direction, Tuple[Flit, Direction]] = {}
+        is_pipeline_mode = len(self._active_stages) > 1
 
         for in_dir in Direction:
             in_port = self.ports[in_dir]
@@ -888,36 +987,67 @@ class XYRouter:
             if flit is None:
                 continue
 
-            # Compute output port
+            # Compute output port via XY routing
             out_dir = self.compute_output_port(flit, in_dir)
-
             if out_dir is None:
                 # Routing failed (illegal Y→X turn or at destination error)
                 in_port.pop_for_routing()
                 self.stats.flits_dropped += 1
                 continue
 
-            # Check output availability (for fast mode, check can_send)
-            # For pipeline mode, check if pipeline can accept
-            if len(self._active_stages) <= 1:
-                # Fast mode: check output port directly
-                out_port = self.ports[out_dir]
-                if not out_port.can_send():
-                    self.stats.buffer_full_events += 1
-                    continue
-            else:
-                # Pipeline mode: check if first stage has capacity
-                # (simplified: allow up to buffer_depth entries per stage)
-                if len(self._pipeline_stages[0]) >= self.config.buffer_depth:
-                    self.stats.buffer_full_events += 1
-                    continue
+            # Check output availability based on mode
+            if not self._check_output_availability(out_dir, is_pipeline_mode):
+                continue
 
             requests[in_dir] = (flit, out_dir)
 
-        # === Step 3: Arbiter grants requests ===
-        grants = self._arbiter.arbitrate(requests)
+        return requests
 
-        # === Step 4: Execute grants ===
+    def _check_output_availability(self, out_dir: Direction, is_pipeline_mode: bool) -> bool:
+        """
+        Check if output is available for forwarding.
+
+        Args:
+            out_dir: Output direction to check.
+            is_pipeline_mode: True if using multi-stage pipeline.
+
+        Returns:
+            True if output is available.
+        """
+        if is_pipeline_mode:
+            # Pipeline mode: check if first stage has capacity
+            if len(self._pipeline_stages[0]) >= self.config.buffer_depth:
+                self.stats.buffer_full_events += 1
+                return False
+        else:
+            # Fast mode: check output port directly
+            out_port = self.ports[out_dir]
+            if not out_port.can_send():
+                self.stats.buffer_full_events += 1
+                return False
+        return True
+
+    def _execute_grants(
+        self,
+        grants: List[Tuple[Direction, Direction, Flit]]
+    ) -> List[Tuple[Flit, Direction]]:
+        """
+        Execute granted routing requests.
+
+        For each grant:
+        1. Pop flit from input buffer
+        2. Handle wormhole locking (if not AXI mode)
+        3. Emit to output port or enter pipeline
+
+        Args:
+            grants: List of (input_dir, output_dir, flit) tuples.
+
+        Returns:
+            List of (flit, output_direction) for successfully forwarded flits.
+        """
+        forwarded: List[Tuple[Flit, Direction]] = []
+        is_pipeline_mode = len(self._active_stages) > 1
+
         for in_dir, out_dir, flit in grants:
             in_port = self.ports[in_dir]
 
@@ -926,39 +1056,95 @@ class XYRouter:
             if popped_flit is None:
                 continue
 
-            # Handle Wormhole locking
-            # In AXI mode, each channel is independent - bypass wormhole locking
-            # because there's no mux/demux and each flit routes independently
-            if self.config.channel_mode != ChannelMode.AXI:
-                if popped_flit.is_head() and not popped_flit.is_single_flit():
-                    self._arbiter.lock(in_dir, out_dir)
+            # Handle Wormhole locking (only in General mode)
+            self._handle_wormhole_locking(popped_flit, in_dir, out_dir)
 
-                if popped_flit.is_tail() or popped_flit.is_single_flit():
-                    self._arbiter.release(in_dir)
-
-            # Enter into pipeline or emit directly
-            if len(self._active_stages) <= 1:
-                # Fast mode: directly set output
-                out_port = self.ports[out_dir]
-                if out_port.set_output(popped_flit):
-                    forwarded.append((popped_flit, out_dir))
-                    self.stats.flits_forwarded += 1
-                    self.stats.port_utilization[out_dir] += 1
-                    self._update_packet_state_on_forward(popped_flit, in_dir)
-                else:
-                    self.stats.flits_dropped += 1
-            else:
-                # Pipeline mode: enter first stage with full latency
-                first_stage_latency = self._active_stages[0][1]
-                self._pipeline_stages[0].append(
-                    (popped_flit, in_dir, out_dir, first_stage_latency)
-                )
-                self._update_packet_state_on_forward(popped_flit, in_dir)
-
-        if grants:
-            self.stats.arbitration_cycles += 1
+            # Emit flit via appropriate mode
+            result = self._emit_flit(popped_flit, in_dir, out_dir, is_pipeline_mode)
+            if result is not None:
+                forwarded.append(result)
 
         return forwarded
+
+    def _handle_wormhole_locking(
+        self,
+        flit: Flit,
+        in_dir: Direction,
+        out_dir: Direction
+    ) -> None:
+        """
+        Handle wormhole locking for multi-flit packets.
+
+        In General mode, multi-flit packets lock the output port to ensure
+        all flits of the packet traverse the same path.
+        In AXI mode, each channel is independent, so no locking is needed.
+
+        Locking Strategy:
+        - AW/AR/B flits: No locking (can pass independently)
+        - W/R flits: Lock on first flit, release on last flit
+        This allows AW pipelining without causing deadlock.
+
+        Args:
+            flit: The flit being routed.
+            in_dir: Input direction.
+            out_dir: Output direction.
+        """
+        # In AXI mode, each channel is independent - no wormhole locking
+        if self.config.channel_mode == ChannelMode.AXI:
+            return
+
+        # Only W/R flits trigger wormhole locking
+        # AW/AR/B flits can pass independently without locking
+        if flit.hdr.axi_ch not in (AxiChannel.W, AxiChannel.R):
+            return
+
+        # Lock on first W/R flit of a packet (seq_num == 0, not single flit)
+        is_first_data_flit = (flit._seq_num == 0)
+        if is_first_data_flit and not flit.is_tail():
+            self._arbiter.lock(in_dir, out_dir)
+
+        # Release on last flit (tail)
+        if flit.is_tail():
+            self._arbiter.release(in_dir)
+
+    def _emit_flit(
+        self,
+        flit: Flit,
+        in_dir: Direction,
+        out_dir: Direction,
+        is_pipeline_mode: bool
+    ) -> Optional[Tuple[Flit, Direction]]:
+        """
+        Emit flit to output port or enter pipeline stage.
+
+        Args:
+            flit: The flit to emit.
+            in_dir: Input direction (for packet state tracking).
+            out_dir: Output direction.
+            is_pipeline_mode: True if using multi-stage pipeline.
+
+        Returns:
+            (flit, output_direction) if emitted in fast mode, None otherwise.
+        """
+        if is_pipeline_mode:
+            # Pipeline mode: enter first stage with full latency
+            first_stage_latency = self._active_stages[0][1]
+            self._pipeline_stages[0].append(
+                (flit, in_dir, out_dir, first_stage_latency)
+            )
+            self._update_packet_state_on_forward(flit, in_dir)
+            return None
+        else:
+            # Fast mode: directly set output
+            out_port = self.ports[out_dir]
+            if out_port.set_output(flit):
+                self.stats.flits_forwarded += 1
+                self.stats.port_utilization[out_dir] += 1
+                self._update_packet_state_on_forward(flit, in_dir)
+                return (flit, out_dir)
+            else:
+                self.stats.flits_dropped += 1
+                return None
 
     def _advance_pipeline(self, current_time: int = 0) -> List[Tuple[Flit, Direction]]:
         """
@@ -1015,6 +1201,7 @@ class XYRouter:
     @property
     def pipeline_depth(self) -> int:
         """Get total pipeline depth (in cycles)."""
+        assert self.config.pipeline is not None
         return self.config.pipeline.total_latency
     
     @property
@@ -1178,14 +1365,6 @@ class Router:
         """Get response router port."""
         return self.resp_router.get_port(direction)
 
-    def connect_req(self, direction: Direction, neighbor_port: RouterPort) -> None:
-        """Connect request router port to neighbor (legacy method)."""
-        self.req_router.connect(direction, neighbor_port)
-
-    def connect_resp(self, direction: Direction, neighbor_port: RouterPort) -> None:
-        """Connect response router port to neighbor (legacy method)."""
-        self.resp_router.connect(direction, neighbor_port)
-
     # =========================================================================
     # Phased Cycle Methods (for wire-based processing)
     # =========================================================================
@@ -1322,22 +1501,6 @@ class EdgeRouter(Router):
         # Edge routers have Local port connected to Selector
         self.selector_connected = False
 
-    def connect_to_selector(
-        self,
-        req_port: RouterPort,
-        resp_port: RouterPort
-    ) -> None:
-        """
-        Connect Local ports to Selector.
-
-        Args:
-            req_port: Selector's request port.
-            resp_port: Selector's response port.
-        """
-        self.req_router.connect(Direction.LOCAL, req_port)
-        self.resp_router.connect(Direction.LOCAL, resp_port)
-        self.selector_connected = True
-
     def clear_accepted_outputs(self) -> Tuple[int, int]:
         """
         Phase 4: Clear accepted outputs for both routers.
@@ -1382,7 +1545,7 @@ def create_router(
     coord: Tuple[int, int],
     is_edge: bool = False,
     config: Optional[RouterConfig] = None
-) -> "Router":
+) -> Union["Router", "EdgeRouter", "AXIModeRouter", "AXIModeEdgeRouter"]:
     """
     Factory function to create appropriate router type.
 
@@ -1732,31 +1895,6 @@ class AXIModeEdgeRouter(AXIModeRouter):
     ):
         super().__init__(coord, config)
         self.selector_connected = False
-
-    def connect_to_selector(
-        self,
-        aw_port: "RouterPort",
-        w_port: "RouterPort",
-        ar_port: "RouterPort",
-        b_port: "RouterPort",
-        r_port: "RouterPort"
-    ) -> None:
-        """
-        Connect LOCAL ports to Selector for all 5 channels.
-
-        Args:
-            aw_port: Selector's AW port for this edge router.
-            w_port: Selector's W port for this edge router.
-            ar_port: Selector's AR port for this edge router.
-            b_port: Selector's B port for this edge router.
-            r_port: Selector's R port for this edge router.
-        """
-        self.aw_router.connect(Direction.LOCAL, aw_port)
-        self.w_router.connect(Direction.LOCAL, w_port)
-        self.ar_router.connect(Direction.LOCAL, ar_port)
-        self.b_router.connect(Direction.LOCAL, b_port)
-        self.r_router.connect(Direction.LOCAL, r_port)
-        self.selector_connected = True
 
     def clear_accepted_outputs(self) -> Dict[AxiChannel, int]:
         """

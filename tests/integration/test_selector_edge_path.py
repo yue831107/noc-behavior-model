@@ -409,14 +409,16 @@ class TestV1SystemEndToEnd:
         )
 
         # Submit writes to different nodes
+        # Address format: [39:32]=Node_ID, [31:0]=Local_Address
+        # Each write needs a unique axi_id to track them separately
         addrs_data = [
-            (0x0001_0000_0000_1000, b"DATA_NODE1"),
-            (0x0002_0000_0000_2000, b"DATA_NODE2"),
-            (0x0003_0000_0000_3000, b"DATA_NODE3"),
+            (0x0000_0001_0000_1000, b"DATA_NODE1", 0),  # Node 1, axi_id=0
+            (0x0000_0002_0000_2000, b"DATA_NODE2", 1),  # Node 2, axi_id=1
+            (0x0000_0003_0000_3000, b"DATA_NODE3", 2),  # Node 3, axi_id=2
         ]
 
-        for addr, data in addrs_data:
-            success = system.submit_write(addr, data)
+        for addr, data, axi_id in addrs_data:
+            success = system.submit_write(addr, data, axi_id=axi_id)
             assert success is True
 
         # Run enough cycles

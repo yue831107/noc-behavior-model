@@ -8,8 +8,9 @@ each AXI channel.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Callable, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, Tuple, Callable, Deque, Set, TYPE_CHECKING
 from enum import Enum
 
 from ..config import TransferConfig
@@ -23,6 +24,8 @@ from .axi_master import (
     AXIMasterStats,
     PendingReadTransaction,
 )
+
+from ..core.router import ChannelMode
 
 if TYPE_CHECKING:
     from .memory import Memory
@@ -216,7 +219,12 @@ class HostAXIMaster:
 
         # Pending write data (axi_id -> list of W beats)
         self._pending_w_beats: Dict[int, List[AXI_W]] = {}
-        self._current_w_axi_id: Optional[int] = None
+
+        # True AXI Outstanding support
+        # W 發送順序 (FIFO - 按 AW 發送順序)
+        self._w_send_order: Deque[int] = deque()
+        # 追蹤已送 AW 但等待 B response 的 transactions
+        self._awaiting_b: Set[int] = set()
 
         # Pending AW queue (transactions waiting to be sent)
         self._pending_aw_queue: List[AXI_AW] = []
@@ -260,7 +268,8 @@ class HostAXIMaster:
         self._state = HostAXIMasterState.IDLE
         self._current_cycle = 0
         self._pending_w_beats.clear()
-        self._current_w_axi_id = None
+        self._w_send_order.clear()
+        self._awaiting_b.clear()
         self._pending_aw_queue.clear()
         self._pending_ar_queue.clear()
         self._read_data.clear()
@@ -357,7 +366,8 @@ class HostAXIMaster:
             # More transfers - reset state
             self._state = HostAXIMasterState.IDLE
             self._pending_w_beats.clear()
-            self._current_w_axi_id = None
+            self._w_send_order.clear()
+            self._awaiting_b.clear()
             self._pending_aw_queue.clear()
             self._pending_ar_queue.clear()
             
@@ -462,9 +472,12 @@ class HostAXIMaster:
                     self._advance_queue()
         else:
             # Write mode: check write completion
+            # 完成條件: 所有 AW 已送出 + 所有 W 已送出 + 所有 B 已收到
             if (self._controller.is_complete and
                 not self._pending_aw_queue and
-                not self._pending_w_beats):
+                not self._pending_w_beats and
+                not self._w_send_order and
+                not self._awaiting_b):
                 self._state = HostAXIMasterState.COMPLETE
                 self.stats.last_b_cycle = cycle
                 # Queue mode: advance to next transfer
@@ -494,27 +507,50 @@ class HostAXIMaster:
 
     def _send_axi_requests(self, cycle: int) -> None:
         """
-        Send AXI requests to connected SlaveNI.
-        
-        Limits to 1 AW, 1 W beat, and 1 AR per cycle for cycle-accurate timing.
+        Send AXI requests with true AXI outstanding pipelining.
+
+        Pipelined behavior (AW first, then W):
+        - Phase 1 (AW): Send if outstanding < max_outstanding (不等 W 完成)
+        - Phase 2 (W): FIFO 順序發送 (按 AW 發送順序，AXI4 不支援 W interleaving)
+        - Phase 3 (AR): Send read address
+
+        Channel Mode 差異:
+        - General Mode: AW/W 互斥 (共用 Request channel)
+        - AXI Mode: AW + W 可並行 (獨立 channel)
+
+        Note: AW pipelining is safe in General Mode because Router's wormhole
+        locking only triggers on W/R flits, not on AW/AR flits.
         """
         if self._slave_ni is None:
             return
 
-        # Send at most 1 AW (Write Address) per cycle
-        if self._pending_aw_queue and self._current_w_axi_id is None:
+        # 判斷是否為 AXI Mode (可並行送 AW+W)
+        is_axi_mode = self._slave_ni.config.channel_mode == ChannelMode.AXI
+        aw_sent_this_cycle = False
+        w_sent_this_cycle = False
+
+        # === Phase 1: Send AW (pipelined - 不等 W 完成) ===
+        current_outstanding = len(self._awaiting_b)
+        max_outstanding = self.transfer_config.max_outstanding
+
+        if self._pending_aw_queue and current_outstanding < max_outstanding:
             aw = self._pending_aw_queue[0]
             if self._slave_ni.process_aw(aw, cycle):
-                # Accepted - remove from queue and start sending W beats
                 self._pending_aw_queue.pop(0)
-                self._current_w_axi_id = aw.awid
+                axi_id = aw.awid
+                self._w_send_order.append(axi_id)
+                self._awaiting_b.add(axi_id)
                 self.stats.aw_sent += 1
+                aw_sent_this_cycle = True
             else:
                 self.stats.aw_blocked += 1
 
-        # Send at most 1 W (Write Data) beat per cycle
-        if self._current_w_axi_id is not None:
-            axi_id = self._current_w_axi_id
+        # === Phase 2: Send W beats (FIFO - 按 AW 順序) ===
+        # General Mode: 若已送 AW 則跳過 W (互斥)
+        # AXI Mode: 可同時送 AW + W (並行)
+        can_send_w = is_axi_mode or not aw_sent_this_cycle
+        if self._w_send_order and can_send_w:
+            axi_id = self._w_send_order[0]
             if axi_id in self._pending_w_beats:
                 w_beats = self._pending_w_beats[axi_id]
                 if w_beats:
@@ -522,15 +558,19 @@ class HostAXIMaster:
                     if self._slave_ni.process_w(w, axi_id, cycle):
                         w_beats.pop(0)
                         self.stats.w_sent += 1
+                        w_sent_this_cycle = True
                         if w.wlast:
-                            # Last beat sent, clear and allow next AW
                             del self._pending_w_beats[axi_id]
-                            self._current_w_axi_id = None
+                            self._w_send_order.popleft()
                     else:
                         self.stats.w_blocked += 1
 
-        # Send at most 1 AR (Read Address) per cycle
-        if self._pending_ar_queue:
+        # === Phase 3: Send AR (Read Address) ===
+        # General Mode: AR 也與 AW/W 互斥
+        # AXI Mode: AR 獨立 channel
+        req_sent = aw_sent_this_cycle or w_sent_this_cycle
+        ar_can_send = is_axi_mode or not req_sent
+        if self._pending_ar_queue and ar_can_send:
             ar = self._pending_ar_queue[0]
             if self._slave_ni.process_ar(ar, cycle):
                 self._pending_ar_queue.pop(0)
@@ -546,6 +586,10 @@ class HostAXIMaster:
         # Receive B (Write Response)
         b_resp = self._slave_ni.get_b_response()
         if b_resp is not None:
+            axi_id = b_resp.bid
+            # 釋放 outstanding slot
+            self._awaiting_b.discard(axi_id)
+
             self._controller.handle_response(b_resp, cycle)
             self.stats.b_received += 1
 
